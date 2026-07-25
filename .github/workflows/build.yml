@@ -21,6 +21,7 @@ permissions:
 jobs:
   prepare:
     name: Determine variants to build
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.0.1
@@ -73,7 +74,7 @@ jobs:
   build:
     name: Build ${{ matrix.full_name }}
     needs: prepare
-    if: ${{ needs.prepare.outputs.variants != '[]' }}
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.prepare.outputs.variants != '[]' }}
     strategy:
       fail-fast: false  # 单个变体失败不影响其它变体
       matrix:
