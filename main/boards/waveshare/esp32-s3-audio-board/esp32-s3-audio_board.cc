@@ -3,6 +3,8 @@
 #include "display/lcd_display.h"
 #include "system_reset.h"
 #include "application.h"
+#include "mcp_server.h"
+#include "ogg_demuxer.h"
 #include "button.h"
 #include "config.h"
 
@@ -18,6 +20,8 @@
 #include "esp_video.h"
 #include "led/circular_strip.h"
 #include "esp_lcd_jd9853.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "waveshare_s3_audio_board"
 
@@ -155,6 +159,90 @@ private:
         });
     }
 
+    void InitializeTools() {
+        McpServer::GetInstance().AddTool(
+            "self.music.play",
+            "Play audio on the device speaker from a URL. "
+            "The URL must point to an OGG/Opus audio stream. "
+            "Always call this tool immediately after obtaining a music URL.",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("title", kPropertyTypeString),
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                std::string url = properties["url"].value<std::string>();
+                std::string title = properties["title"].value<std::string>();
+
+                struct Params { std::string url; std::string title; };
+                auto* p = new Params{url, title};
+
+                xTaskCreate([](void* arg) {
+                    auto* p = static_cast<Params*>(arg);
+                    std::string url = std::move(p->url);
+                    std::string title = std::move(p->title);
+                    delete p;
+
+                    auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+                    if (!http->Open("GET", url)) {
+                        ESP_LOGE(TAG, "music.play: open failed: %s", url.c_str());
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+                    if (http->GetStatusCode() != 200) {
+                        ESP_LOGE(TAG, "music.play: HTTP %d", http->GetStatusCode());
+                        http->Close();
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+
+                    ESP_LOGI(TAG, "music.play: streaming '%s'", title.c_str());
+
+                    auto& app = Application::GetInstance();
+                    auto& audio = app.GetAudioService();
+                    bool abort = false;
+
+                    auto demuxer = std::make_unique<OggDemuxer>();
+                    demuxer->OnDemuxerFinished([&audio, &app, &abort](const uint8_t* data, int sample_rate, size_t len) {
+                        if (abort) return;
+                        // Stop music if user woke the device or a new TTS stream started
+                        auto state = app.GetDeviceState();
+                        if (state == kDeviceStateListening ||
+                            state == kDeviceStateThinking  ||
+                            state == kDeviceStateSpeaking) {
+                            abort = true;
+                            return;
+                        }
+                        auto packet = std::make_unique<AudioStreamPacket>();
+                        packet->sample_rate = sample_rate;
+                        packet->frame_duration = 60;
+                        packet->payload.assign(data, data + len);
+                        // Non-blocking push; back off when queue is full
+                        while (!audio.PushPacketToDecodeQueue(std::move(packet), false)) {
+                            vTaskDelay(pdMS_TO_TICKS(20));
+                            if (app.GetDeviceState() != kDeviceStateIdle) {
+                                abort = true;
+                                return;
+                            }
+                        }
+                    });
+                    demuxer->Reset();
+
+                    constexpr size_t BUF_SIZE = 4096;
+                    std::vector<uint8_t> buf(BUF_SIZE);
+                    while (!abort) {
+                        int n = http->Read(reinterpret_cast<char*>(buf.data()), BUF_SIZE);
+                        if (n <= 0) break;
+                        demuxer->Process(buf.data(), n);
+                    }
+                    http->Close();
+                    ESP_LOGI(TAG, "music.play: %s '%s'", abort ? "aborted" : "ended", title.c_str());
+                    vTaskDelete(nullptr);
+                }, "music_play", 8192, p, 5, nullptr);
+
+                return std::string("正在播放: ") + title;
+            });
+    }
+
     void InitializeCamera() {
         static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
             .data_width = CAM_CTLR_DATA_WIDTH_8,
@@ -209,6 +297,7 @@ public:
         #endif
         InitializeCamera();
         GetBacklight()->RestoreBrightness();
+        InitializeTools();
     }
 
     virtual Led* GetLed() override {
