@@ -207,7 +207,6 @@ private:
                         // Stop music if user woke the device or a new TTS stream started
                         auto state = app.GetDeviceState();
                         if (state == kDeviceStateListening ||
-                            state == kDeviceStateThinking  ||
                             state == kDeviceStateSpeaking) {
                             abort = true;
                             return;
