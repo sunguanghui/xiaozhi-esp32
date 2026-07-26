@@ -1179,6 +1179,47 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
+void Application::AddAudioData(AudioStreamPacket&& packet) {
+    auto codec = Board::GetInstance().GetAudioCodec();
+    if (state_machine_.GetState() != kDeviceStateIdle || !codec->output_enabled()) {
+        return;
+    }
+    if (packet.payload.size() < 2) {
+        return;
+    }
+
+    size_t num_samples = packet.payload.size() / sizeof(int16_t);
+    std::vector<int16_t> pcm_data(num_samples);
+    memcpy(pcm_data.data(), packet.payload.data(), packet.payload.size());
+
+    if (packet.sample_rate > 0 && packet.sample_rate != codec->output_sample_rate()) {
+        if (codec->SetOutputSampleRate(packet.sample_rate)) {
+            ESP_LOGI(TAG, "Music: switched codec output to %d Hz", packet.sample_rate);
+        } else {
+            // Upsample via linear interpolation
+            float ratio = static_cast<float>(codec->output_sample_rate()) / packet.sample_rate;
+            size_t out_size = static_cast<size_t>(num_samples * ratio + 0.5f);
+            std::vector<int16_t> resampled;
+            resampled.reserve(out_size);
+            for (size_t i = 0; i < num_samples; ++i) {
+                resampled.push_back(pcm_data[i]);
+                int steps = static_cast<int>(ratio) - 1;
+                if (steps > 0 && i + 1 < num_samples) {
+                    for (int j = 1; j <= steps; ++j) {
+                        float t = static_cast<float>(j) / (steps + 1);
+                        resampled.push_back(static_cast<int16_t>(
+                            pcm_data[i] + (pcm_data[i + 1] - pcm_data[i]) * t));
+                    }
+                }
+            }
+            pcm_data = std::move(resampled);
+        }
+    }
+
+    codec->OutputData(pcm_data);
+    audio_service_.UpdateOutputTimestamp();
+}
+
 void Application::ResetProtocol() {
     Schedule([this]() {
         // Close audio channel if opened

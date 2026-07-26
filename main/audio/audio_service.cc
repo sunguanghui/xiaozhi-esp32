@@ -822,3 +822,7 @@ bool AudioService::InitializeAudioEngine() {
     audio_engine_->EnableDeviceAec(device_aec_enabled_);
     return true;
 }
+
+void AudioService::UpdateOutputTimestamp() {
+    last_output_time_ = std::chrono::steady_clock::now();
+}

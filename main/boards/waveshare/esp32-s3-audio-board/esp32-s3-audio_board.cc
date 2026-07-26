@@ -22,6 +22,8 @@
 #include "esp_lcd_jd9853.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "esp_audio_types.h"
+#include <cstring>
 
 #define TAG "waveshare_s3_audio_board"
 
@@ -197,32 +199,92 @@ private:
 
                     ESP_LOGI(TAG, "music.play: streaming '%s'", title.c_str());
 
+                    // Create a dedicated Opus decoder for music playback
+                    void* music_decoder = nullptr;
+                    esp_opus_dec_cfg_t dec_cfg = {
+                        .sample_rate    = 48000,
+                        .channel        = ESP_AUDIO_MONO,
+                        .frame_duration = (esp_opus_dec_frame_duration_t)ESP_OPUS_ENC_FRAME_DURATION_60_MS,
+                        .self_delimited = false,
+                    };
+                    esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &music_decoder);
+                    if (!music_decoder) {
+                        ESP_LOGE(TAG, "music.play: failed to create opus decoder");
+                        http->Close();
+                        vTaskDelete(nullptr);
+                        return;
+                    }
+
                     auto& app = Application::GetInstance();
-                    auto& audio = app.GetAudioService();
                     bool abort = false;
+                    int current_sample_rate = 48000;
 
                     auto demuxer = std::make_unique<OggDemuxer>();
-                    demuxer->OnDemuxerFinished([&audio, &app, &abort](const uint8_t* data, int sample_rate, size_t len) {
+                    demuxer->OnDemuxerFinished([&](const uint8_t* data, int sample_rate, size_t len) {
                         if (abort) return;
-                        // Stop music if user woke the device or a new TTS stream started
-                        auto state = app.GetDeviceState();
-                        if (state == kDeviceStateListening ||
-                            state == kDeviceStateSpeaking) {
-                            abort = true;
-                            return;
-                        }
-                        auto packet = std::make_unique<AudioStreamPacket>();
-                        packet->sample_rate = sample_rate;
-                        packet->frame_duration = 60;
-                        packet->payload.assign(data, data + len);
-                        // Non-blocking push; back off when queue is full
-                        while (!audio.PushPacketToDecodeQueue(std::move(packet), false)) {
-                            vTaskDelay(pdMS_TO_TICKS(20));
-                            if (app.GetDeviceState() != kDeviceStateIdle) {
+
+                        // Reconfigure decoder if sample rate changed
+                        if (sample_rate != current_sample_rate) {
+                            current_sample_rate = sample_rate;
+                            esp_opus_dec_close(music_decoder);
+                            music_decoder = nullptr;
+                            esp_opus_dec_cfg_t new_cfg = {
+                                .sample_rate    = (uint32_t)sample_rate,
+                                .channel        = ESP_AUDIO_MONO,
+                                .frame_duration = (esp_opus_dec_frame_duration_t)ESP_OPUS_ENC_FRAME_DURATION_60_MS,
+                                .self_delimited = false,
+                            };
+                            esp_opus_dec_open(&new_cfg, sizeof(new_cfg), &music_decoder);
+                            if (!music_decoder) {
                                 abort = true;
                                 return;
                             }
                         }
+
+                        // Decode Opus packet to PCM
+                        constexpr size_t MAX_PCM_SAMPLES = 48000 / 1000 * 60; // 60ms at 48kHz
+                        std::vector<int16_t> pcm(MAX_PCM_SAMPLES);
+                        esp_audio_dec_in_raw_t raw = {
+                            .buffer        = const_cast<uint8_t*>(data),
+                            .len           = (uint32_t)len,
+                            .consumed      = 0,
+                            .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+                        };
+                        esp_audio_dec_out_frame_t out_frame = {
+                            .buffer       = (uint8_t*)pcm.data(),
+                            .len          = (uint32_t)(pcm.size() * sizeof(int16_t)),
+                            .decoded_size = 0,
+                        };
+                        esp_audio_dec_info_t dec_info = {};
+                        auto ret = esp_opus_dec_decode(music_decoder, &raw, &out_frame, &dec_info);
+                        if (ret != ESP_AUDIO_ERR_OK) {
+                            ESP_LOGW(TAG, "music.play: opus decode err %d", ret);
+                            return;
+                        }
+                        pcm.resize(out_frame.decoded_size / sizeof(int16_t));
+
+                        // Poll until device is idle; ToggleChatState to escape Speaking/Listening
+                        while (!abort) {
+                            auto state = app.GetDeviceState();
+                            if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+                                app.ToggleChatState();
+                                vTaskDelay(pdMS_TO_TICKS(300));
+                                continue;
+                            } else if (state != kDeviceStateIdle) {
+                                vTaskDelay(pdMS_TO_TICKS(50));
+                                continue;
+                            }
+                            break;
+                        }
+                        if (abort) return;
+
+                        // Deliver decoded PCM directly to codec, bypassing queues
+                        auto packet = std::make_unique<AudioStreamPacket>();
+                        packet->sample_rate = current_sample_rate;
+                        packet->frame_duration = 60;
+                        packet->payload.resize(pcm.size() * sizeof(int16_t));
+                        memcpy(packet->payload.data(), pcm.data(), packet->payload.size());
+                        app.AddAudioData(std::move(*packet));
                     });
                     demuxer->Reset();
 
@@ -234,9 +296,12 @@ private:
                         demuxer->Process(buf.data(), n);
                     }
                     http->Close();
+                    if (music_decoder) {
+                        esp_opus_dec_close(music_decoder);
+                    }
                     ESP_LOGI(TAG, "music.play: %s '%s'", abort ? "aborted" : "ended", title.c_str());
                     vTaskDelete(nullptr);
-                }, "music_play", 8192, p, 5, nullptr);
+                }, "music_play", 16384, p, 5, nullptr);
 
                 return std::string("正在播放: ") + title;
             });
