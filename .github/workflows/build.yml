@@ -109,12 +109,26 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build selected board
-        uses: espressif/esp-idf-ci-action@v1
+      - name: Cache ESP-IDF tools
+        uses: actions/cache@v4
         with:
-          esp_idf_version: v6.0.1
-          target: esp32s3
-          command: python scripts/release.py ${{ github.event.inputs.board }} --name ${{ github.event.inputs.board }}
+          path: |
+            ~/.espressif
+            ~/esp-idf
+          key: esp-idf-v6.0.1-esp32s3-${{ runner.os }}
+
+      - name: Install ESP-IDF
+        run: |
+          if [ ! -f ~/esp-idf/export.sh ]; then
+            git clone --recursive --shallow-submodules -b v6.0.1 \
+              https://github.com/espressif/esp-idf.git ~/esp-idf
+          fi
+          ~/esp-idf/install.sh esp32s3
+
+      - name: Build selected board
+        run: |
+          . ~/esp-idf/export.sh
+          python scripts/release.py ${{ github.event.inputs.board }} --name ${{ github.event.inputs.board }}
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
