@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       board:
-        description: 'Board to build (e.g. esp32-s3-audio-board), leave empty to build all'
+        description: 'Board to build (e.g. waveshare/esp32-s3-audio-board), leave empty to build all'
         required: false
-        default: 'esp32-s3-audio-board'
+        default: 'waveshare/esp32-s3-audio-board'
 
 permissions:
   contents: read
