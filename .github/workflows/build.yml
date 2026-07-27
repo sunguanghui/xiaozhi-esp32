@@ -128,7 +128,9 @@ jobs:
       - name: Build selected board
         run: |
           . ~/esp-idf/export.sh
-          python scripts/release.py ${{ github.event.inputs.board }} --name ${{ github.event.inputs.board }}
+          BOARD="${{ github.event.inputs.board }}"
+          NAME="${BOARD##*/}"
+          python scripts/release.py "$BOARD" --name "$NAME"
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
