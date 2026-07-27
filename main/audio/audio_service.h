@@ -136,6 +136,7 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void UpdateOutputTimestamp();
+    void EnableOutputForMusic();
     void SetModelsList(srmodel_list_t* models_list);
 
 private:

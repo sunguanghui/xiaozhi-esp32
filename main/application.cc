@@ -1181,11 +1181,16 @@ void Application::PlaySound(const std::string_view& sound) { audio_service_.Play
 
 void Application::AddAudioData(AudioStreamPacket&& packet) {
     auto codec = Board::GetInstance().GetAudioCodec();
-    if (state_machine_.GetState() != kDeviceStateIdle || !codec->output_enabled()) {
+    if (state_machine_.GetState() != kDeviceStateIdle) {
         return;
     }
     if (packet.payload.size() < 2) {
         return;
+    }
+
+    // Enable output if it was powered off (same as AudioService::PlaySound)
+    if (!codec->output_enabled()) {
+        audio_service_.EnableOutputForMusic();
     }
 
     size_t num_samples = packet.payload.size() / sizeof(int16_t);
@@ -1198,7 +1203,6 @@ void Application::AddAudioData(AudioStreamPacket&& packet) {
         size_t out_size = (size_t)((uint64_t)num_samples * out_rate / in_rate);
         std::vector<int16_t> resampled(out_size);
         for (size_t i = 0; i < out_size; ++i) {
-            // Map output sample i back to input position
             float src = (float)i * in_rate / out_rate;
             size_t idx = (size_t)src;
             float frac = src - idx;

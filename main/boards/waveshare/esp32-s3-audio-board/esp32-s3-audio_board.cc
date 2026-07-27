@@ -233,16 +233,13 @@ private:
                                 continue;
                             }
 
-                            // Wait until Idle; abort only if user actively interrupts (Listening)
+                            // Wait until Idle; abort only if a new conversation starts
                             while (!op->abort_flag->load()) {
                                 auto state = app.GetDeviceState();
                                 if (state == kDeviceStateIdle) break;
-                                if (state == kDeviceStateListening) {
-                                    op->abort_flag->store(true);
-                                    break;
-                                }
-                                // Speaking (TTS reply) — wait it out
-                                vTaskDelay(pdMS_TO_TICKS(50));
+                                // Speaking or Listening — wait it out (Listening is auto-stop mode,
+                                // it returns to Idle quickly if no voice is detected)
+                                vTaskDelay(pdMS_TO_TICKS(100));
                             }
 
                             if (op->abort_flag->load()) {
