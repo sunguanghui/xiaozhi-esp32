@@ -1193,19 +1193,19 @@ void Application::AddAudioData(AudioStreamPacket&& packet) {
     memcpy(pcm_data.data(), packet.payload.data(), packet.payload.size());
 
     if (packet.sample_rate > 0 && packet.sample_rate != codec->output_sample_rate()) {
-        float ratio = static_cast<float>(codec->output_sample_rate()) / packet.sample_rate;
-        size_t out_size = static_cast<size_t>(num_samples * ratio + 0.5f);
-        std::vector<int16_t> resampled;
-        resampled.reserve(out_size);
-        for (size_t i = 0; i < num_samples; ++i) {
-            resampled.push_back(pcm_data[i]);
-            int steps = static_cast<int>(ratio) - 1;
-            if (steps > 0 && i + 1 < num_samples) {
-                for (int j = 1; j <= steps; ++j) {
-                    float t = static_cast<float>(j) / (steps + 1);
-                    resampled.push_back(static_cast<int16_t>(
-                        pcm_data[i] + (pcm_data[i + 1] - pcm_data[i]) * t));
-                }
+        int in_rate  = packet.sample_rate;
+        int out_rate = codec->output_sample_rate();
+        size_t out_size = (size_t)((uint64_t)num_samples * out_rate / in_rate);
+        std::vector<int16_t> resampled(out_size);
+        for (size_t i = 0; i < out_size; ++i) {
+            // Map output sample i back to input position
+            float src = (float)i * in_rate / out_rate;
+            size_t idx = (size_t)src;
+            float frac = src - idx;
+            if (idx + 1 < num_samples) {
+                resampled[i] = (int16_t)(pcm_data[idx] + (pcm_data[idx + 1] - pcm_data[idx]) * frac);
+            } else {
+                resampled[i] = pcm_data[idx < num_samples ? idx : num_samples - 1];
             }
         }
         pcm_data = std::move(resampled);

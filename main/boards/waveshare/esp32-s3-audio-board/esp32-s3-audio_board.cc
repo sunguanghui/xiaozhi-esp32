@@ -203,7 +203,7 @@ private:
 
                     // PCM packet queue between decoder and output
                     struct PcmPacket { std::vector<int16_t> pcm; int sample_rate; };
-                    constexpr int PCM_QUEUE_LEN = 8;
+                    constexpr int PCM_QUEUE_LEN = 200;
                     QueueHandle_t pcm_queue = xQueueCreate(PCM_QUEUE_LEN, sizeof(PcmPacket*));
 
                     // Heap-allocate shared state so both tasks outlive the decode task's stack
@@ -334,17 +334,11 @@ private:
                         }
                         pkt->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
 
-                        // Block until queue has space or abort; drop frames during Speaking
+                        // Block until queue has space or abort; never drop during Speaking
                         while (!abort_flag->load()) {
                             auto state = Application::GetInstance().GetDeviceState();
                             if (state == kDeviceStateListening) {
                                 abort_flag->store(true);
-                                break;
-                            }
-                            if (state == kDeviceStateSpeaking) {
-                                // TTS playing — drop this frame to keep HTTP flowing
-                                delete pkt;
-                                pkt = nullptr;
                                 break;
                             }
                             if (xQueueSend(pcm_queue, &pkt, pdMS_TO_TICKS(100)) == pdTRUE) {
