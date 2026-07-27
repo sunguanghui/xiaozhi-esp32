@@ -233,9 +233,19 @@ private:
                                 continue;
                             }
 
-                            // Abort if device left Idle (e.g. wake word)
-                            if (app.GetDeviceState() != kDeviceStateIdle) {
-                                op->abort_flag->store(true);
+                            // Wait until Idle; abort only if user actively interrupts (Listening)
+                            while (!op->abort_flag->load()) {
+                                auto state = app.GetDeviceState();
+                                if (state == kDeviceStateIdle) break;
+                                if (state == kDeviceStateListening) {
+                                    op->abort_flag->store(true);
+                                    break;
+                                }
+                                // Speaking (TTS reply) — wait it out
+                                vTaskDelay(pdMS_TO_TICKS(50));
+                            }
+
+                            if (op->abort_flag->load()) {
                                 delete pkt;
                                 continue;
                             }
@@ -324,8 +334,19 @@ private:
                         }
                         pkt->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
 
-                        // Block until queue has space or abort
+                        // Block until queue has space or abort; drop frames during Speaking
                         while (!abort_flag->load()) {
+                            auto state = Application::GetInstance().GetDeviceState();
+                            if (state == kDeviceStateListening) {
+                                abort_flag->store(true);
+                                break;
+                            }
+                            if (state == kDeviceStateSpeaking) {
+                                // TTS playing — drop this frame to keep HTTP flowing
+                                delete pkt;
+                                pkt = nullptr;
+                                break;
+                            }
                             if (xQueueSend(pcm_queue, &pkt, pdMS_TO_TICKS(100)) == pdTRUE) {
                                 pkt = nullptr;
                                 break;
