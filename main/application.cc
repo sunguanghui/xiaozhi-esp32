@@ -822,6 +822,12 @@ void Application::HandleWakeWordDetectedEvent() {
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
+    // Stop music when wake word is detected (user wants to talk)
+    if (audio_service_.IsMusicPlaying()) {
+        ESP_LOGI(TAG, "Stopping music due to wake word detection");
+        audio_service_.StopMusic();
+    }
+
     if (state == kDeviceStateIdle) {
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
@@ -910,13 +916,8 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
-    // Stop music only when user starts listening (conversation takes priority)
-    // Don't stop music when AI is speaking - let music continue playing
-    if (new_state == kDeviceStateListening) {
-        if (audio_service_.IsMusicPlaying()) {
-            audio_service_.StopMusic();
-        }
-    }
+    // Music stopping is now handled in HandleWakeWordDetectedEvent
+    // Don't stop music when transitioning between states
     clock_ticks_ = 0;
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
