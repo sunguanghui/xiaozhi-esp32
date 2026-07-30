@@ -115,13 +115,19 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
-    
+
     /**
      * Reset protocol resources (thread-safe)
      * Can be called from any task to release resources allocated after network connected
      * This includes closing audio channel, resetting protocol and ota objects
      */
     void ResetProtocol();
+
+    /**
+     * Handle music playback message
+     * Can be called from MCP tools to play music
+     */
+    void HandleMusicMessage(const cJSON* root);
 
 private:
     Application();
@@ -175,12 +181,9 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
-    
+
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
-
-    // Bilibili music message handler
-    void HandleMusicMessage(const cJSON* root);
 };
 
 
