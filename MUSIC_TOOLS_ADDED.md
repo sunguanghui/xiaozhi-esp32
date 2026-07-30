@@ -98,6 +98,7 @@ AI 会自动调用相应的 `self.music.*` 工具来执行操作。
 ## 修改的文件
 
 - `main/mcp_server.cc` - 添加了 4 个音乐相关的 MCP 工具
+- `main/application.h` - 将 `HandleMusicMessage` 方法从私有改为公有，允许 MCP 工具调用
 
 ## 注意事项
 
