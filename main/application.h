@@ -154,6 +154,7 @@ private:
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    DeviceState previous_state_{kDeviceStateUnknown};  // For detecting Speaking->Listening transition
 
 
     // Event handlers

@@ -917,6 +917,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
+    DeviceState old_state = previous_state_;
+    previous_state_ = new_state;
+
     // Music stopping is now handled in HandleWakeWordDetectedEvent
     // Don't stop music when transitioning between states
     clock_ticks_ = 0;
@@ -965,6 +968,28 @@ void Application::HandleStateChangedEvent() {
                 }
             } else {
                 ConfigureWakeWordForListening();
+            }
+
+            // If AI just finished speaking (Speaking->Listening) and music was paused,
+            // close the session after 3 seconds of silence so music can resume immediately
+            // instead of waiting for Dify's 60-90s timeout.
+            if (old_state == kDeviceStateSpeaking && audio_service_.HasMusicToResume()) {
+                ESP_LOGI(TAG, "Music paused: will resume in 3s if user stays silent");
+                xTaskCreate([](void* arg) {
+                    auto* app = static_cast<Application*>(arg);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    app->Schedule([app]() {
+                        if (app->GetDeviceState() == kDeviceStateListening &&
+                            !app->audio_service_.IsVoiceDetected() &&
+                            app->audio_service_.HasMusicToResume() &&
+                            app->protocol_ && app->protocol_->IsAudioChannelOpened()) {
+                            ESP_LOGI("Application", "Closing conversation to resume music");
+                            app->protocol_->CloseAudioChannel(false);
+                            app->SetDeviceState(kDeviceStateIdle);
+                        }
+                    });
+                    vTaskDelete(nullptr);
+                }, "music_resume", 2048, this, 1, nullptr);
             }
             break;
         case kDeviceStateSpeaking:
