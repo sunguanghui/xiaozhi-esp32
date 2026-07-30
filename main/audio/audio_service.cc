@@ -754,6 +754,7 @@ void AudioService::ResetDecoder() {
         audio_decode_queue_.clear();
 
         // Clear playback queue but preserve music tasks (timestamp == 0)
+        size_t before_size = audio_playback_queue_.size();
         if (music_playing_.load()) {
             // Keep music tasks in playback queue, remove only TTS tasks
             audio_playback_queue_.erase(
@@ -763,9 +764,13 @@ void AudioService::ResetDecoder() {
                     }),
                 audio_playback_queue_.end()
             );
+            size_t after_size = audio_playback_queue_.size();
+            ESP_LOGI(TAG, "ResetDecoder: music_playing=true, queue before=%u, after=%u, removed=%u TTS tasks",
+                     before_size, after_size, before_size - after_size);
         } else {
             // No music playing, clear everything
             audio_playback_queue_.clear();
+            ESP_LOGI(TAG, "ResetDecoder: music_playing=false, cleared all %u tasks", before_size);
         }
 
         audio_testing_queue_.clear();
@@ -1009,27 +1014,42 @@ void AudioService::MusicTask() {
         task->timestamp = 0;
         task->pcm       = std::move(pcm);
 
+        ESP_LOGD(TAG, "MusicTask: decoded %u PCM samples, pushing to queue", task->pcm.size());
+
         while (!music_abort_.load()) {
             std::unique_lock<std::mutex> lock(audio_queue_mutex_);
             if (audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
                 audio_playback_queue_.push_back(std::move(task));
                 audio_queue_cv_.notify_all();
+                ESP_LOGD(TAG, "MusicTask: pushed to queue, queue_size=%u", audio_playback_queue_.size());
                 return;
             }
             lock.unlock();
+            ESP_LOGD(TAG, "MusicTask: queue full (%u), waiting...", audio_playback_queue_.size());
             vTaskDelay(pdMS_TO_TICKS(20));
         }
         // aborted — task is dropped
+        ESP_LOGW(TAG, "MusicTask: task dropped (aborted)");
     });
     demuxer->Reset();
 
     constexpr size_t kBufSize = 4096;
     std::vector<uint8_t> buf(kBufSize);
+    size_t total_bytes = 0;
     while (!music_abort_.load()) {
         int n = http->Read(reinterpret_cast<char*>(buf.data()), kBufSize);
-        if (n <= 0) break;
+        if (n <= 0) {
+            ESP_LOGI(TAG, "MusicTask: HTTP read ended, n=%d, total_bytes=%u", n, total_bytes);
+            break;
+        }
+        total_bytes += n;
         demuxer->Process(buf.data(), n);
+        if (total_bytes % (100 * 1024) == 0) {  // Log every 100KB
+            ESP_LOGD(TAG, "MusicTask: downloaded %u KB", total_bytes / 1024);
+        }
     }
 
+    ESP_LOGI(TAG, "MusicTask: streaming finished, total=%u KB, aborted=%d",
+             total_bytes / 1024, music_abort_.load());
     cleanup();
 }
