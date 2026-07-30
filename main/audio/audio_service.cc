@@ -895,7 +895,11 @@ bool AudioService::ResumeMusic() {
     uint32_t time_secs = music_resume_time_secs_;
     music_resume_url_.clear();
     music_resume_time_secs_ = 0;
-    // Append start_time parameter so the server seeks to the saved position
+    // Remove any existing start_time parameter to avoid accumulation
+    auto st_pos = url.find("&start_time=");
+    if (st_pos != std::string::npos) {
+        url = url.substr(0, st_pos);
+    }
     if (time_secs > 0) {
         url += "&start_time=" + std::to_string(time_secs);
     }

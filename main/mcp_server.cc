@@ -183,7 +183,9 @@ void McpServer::AddCommonTools() {
         });
 
     AddTool("self.music.stop",
-        "Stop the currently playing music.\n"
+        "Stop music. Use this when user asks to stop, turn off, close, or cancel music.\n"
+        "IMPORTANT: Call this even if get_status shows playing=false, because music might be paused.\n"
+        "This clears both playing and paused music so it won't auto-resume.\n"
         "Return:\n"
         "  A boolean indicating success or failure.",
         PropertyList(),
@@ -197,14 +199,18 @@ void McpServer::AddCommonTools() {
     AddTool("self.music.get_status",
         "Get the current music playback status.\n"
         "Return:\n"
-        "  A JSON object with the music status (playing: true/false).",
+        "  A JSON object: {playing: bool, paused: bool}\n"
+        "  playing=true means music is actively playing.\n"
+        "  paused=true means music was interrupted and will auto-resume after conversation.",
         PropertyList(),
         [](const PropertyList& properties) -> ReturnValue {
             auto& app = Application::GetInstance();
             bool is_playing = app.GetAudioService().IsMusicPlaying();
+            bool is_paused  = !is_playing && app.GetAudioService().HasMusicToResume();
 
             cJSON* json = cJSON_CreateObject();
             cJSON_AddBoolToObject(json, "playing", is_playing);
+            cJSON_AddBoolToObject(json, "paused",  is_paused);
             return json;
         });
 

@@ -1384,10 +1384,12 @@ void Application::HandleMusicMessage(const cJSON* root) {
         auto& app = Application::GetInstance();
         app.GetAudioService().PlayMusicFromUrl(opus_url);
 
-        // Close the audio channel after a short delay to prevent AI from continuing to talk
-        // This avoids TTS interrupting the music playback
+        // Wait 1 second in the background task (NOT in the main task via Schedule)
+        // to avoid blocking the main loop and triggering the task watchdog.
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Close the audio channel to prevent AI from continuing to talk over the music
         app.Schedule([&app]() {
-            vTaskDelay(pdMS_TO_TICKS(1000));  // Wait 1 second for music to start
             if (app.protocol_ && app.protocol_->IsAudioChannelOpened()) {
                 ESP_LOGI(TAG, "Closing audio channel to prevent TTS during music playback");
                 app.protocol_->CloseAudioChannel(false);  // Don't send goodbye
