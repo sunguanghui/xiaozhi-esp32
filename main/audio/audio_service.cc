@@ -855,7 +855,7 @@ void AudioService::EnableOutputForMusic() {
     }
 }
 
-void AudioService::PlayMusicFromUrl(const std::string& url, size_t start_offset) {
+void AudioService::PlayMusicFromUrl(const std::string& url) {
     // Stop any existing music and wait briefly for the task to exit
     if (music_playing_.load() || music_task_handle_ != nullptr) {
         music_abort_.store(true);
@@ -867,9 +867,8 @@ void AudioService::PlayMusicFromUrl(const std::string& url, size_t start_offset)
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         music_url_ = url;
-        music_start_offset_ = start_offset;
     }
-    music_bytes_downloaded_.store(start_offset);  // Track absolute position
+    music_frames_decoded_.store(0);
     music_abort_.store(false);
     music_playing_.store(true);
     EnableOutputForMusic();
@@ -880,30 +879,34 @@ void AudioService::PlayMusicFromUrl(const std::string& url, size_t start_offset)
 
 void AudioService::PauseMusic() {
     if (!music_playing_.load()) return;
-    size_t paused_at = music_bytes_downloaded_.load();
+    uint32_t time_secs = music_frames_decoded_.load() * OPUS_FRAME_DURATION_MS / 1000;
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         music_resume_url_ = music_url_;
     }
-    music_resume_bytes_ = paused_at;
-    ESP_LOGI(TAG, "PauseMusic: saving resume position at %u bytes", paused_at);
+    music_resume_time_secs_ = time_secs;
+    ESP_LOGI(TAG, "PauseMusic: saving resume position at %u seconds", time_secs);
     StopMusic();
 }
 
 bool AudioService::ResumeMusic() {
     if (music_resume_url_.empty()) return false;
     std::string url = music_resume_url_;
-    size_t offset = music_resume_bytes_;
+    uint32_t time_secs = music_resume_time_secs_;
     music_resume_url_.clear();
-    music_resume_bytes_ = 0;
-    ESP_LOGI(TAG, "ResumeMusic: resuming from %u bytes", offset);
-    PlayMusicFromUrl(url, offset);
+    music_resume_time_secs_ = 0;
+    // Append start_time parameter so the server seeks to the saved position
+    if (time_secs > 0) {
+        url += "&start_time=" + std::to_string(time_secs);
+    }
+    ESP_LOGI(TAG, "ResumeMusic: resuming from %u seconds", time_secs);
+    PlayMusicFromUrl(url);
     return true;
 }
 
 void AudioService::ClearMusicResume() {
     music_resume_url_.clear();
-    music_resume_bytes_ = 0;
+    music_resume_time_secs_ = 0;
 }
 
 void AudioService::StopMusic() {
@@ -925,13 +928,11 @@ void AudioService::StopMusic() {
 
 void AudioService::MusicTask() {
     std::string url;
-    size_t start_offset;
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         url = music_url_;
-        start_offset = music_start_offset_;
     }
-    ESP_LOGI(TAG, "MusicTask: start streaming '%s' (offset=%u)", url.c_str(), start_offset);
+    ESP_LOGI(TAG, "MusicTask: start streaming '%s'", url.c_str());
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
@@ -952,26 +953,16 @@ void AudioService::MusicTask() {
         vTaskDelete(nullptr);
     };
 
-    // Set Range header for resume from a specific position
-    if (start_offset > 0) {
-        http->SetHeader("Range", "bytes=" + std::to_string(start_offset) + "-");
-        ESP_LOGI(TAG, "MusicTask: requesting Range: bytes=%u-", start_offset);
-    }
-
     if (!http->Open("GET", url)) {
         ESP_LOGE(TAG, "MusicTask: HTTP open failed");
         cleanup();
         return;
     }
     int status_code = http->GetStatusCode();
-    // Accept 200 (full content) and 206 (partial content for Range requests)
-    if (status_code != 200 && status_code != 206) {
+    if (status_code != 200) {
         ESP_LOGE(TAG, "MusicTask: HTTP status %d", status_code);
         cleanup();
         return;
-    }
-    if (status_code == 206) {
-        ESP_LOGI(TAG, "MusicTask: server supports range requests, resuming from %u bytes", start_offset);
     }
 
     // Create a dedicated Opus decoder for music (keeps TTS decoder untouched)
@@ -1014,6 +1005,9 @@ void AudioService::MusicTask() {
             if (!music_opus_decoder_) { music_abort_.store(true); return; }
             maybe_open_resampler(sample_rate);
         }
+
+        // Count decoded frames for time tracking (used by PauseMusic)
+        ++music_frames_decoded_;
 
         // Decode Opus packet → PCM
         constexpr size_t kMaxPcmSamples = 48000 / 1000 * OPUS_FRAME_DURATION_MS;
