@@ -190,6 +190,7 @@ void McpServer::AddCommonTools() {
         [](const PropertyList& properties) -> ReturnValue {
             auto& app = Application::GetInstance();
             app.GetAudioService().StopMusic();
+            app.GetAudioService().ClearMusicResume();  // Permanent stop, don't auto-resume
             return true;
         });
 

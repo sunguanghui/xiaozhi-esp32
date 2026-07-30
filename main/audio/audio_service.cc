@@ -855,7 +855,7 @@ void AudioService::EnableOutputForMusic() {
     }
 }
 
-void AudioService::PlayMusicFromUrl(const std::string& url) {
+void AudioService::PlayMusicFromUrl(const std::string& url, size_t start_offset) {
     // Stop any existing music and wait briefly for the task to exit
     if (music_playing_.load() || music_task_handle_ != nullptr) {
         music_abort_.store(true);
@@ -867,13 +867,43 @@ void AudioService::PlayMusicFromUrl(const std::string& url) {
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         music_url_ = url;
+        music_start_offset_ = start_offset;
     }
+    music_bytes_downloaded_.store(start_offset);  // Track absolute position
     music_abort_.store(false);
     music_playing_.store(true);
     EnableOutputForMusic();
     xTaskCreate([](void* arg) {
         static_cast<AudioService*>(arg)->MusicTask();
     }, "music", 16384, this, 5, &music_task_handle_);
+}
+
+void AudioService::PauseMusic() {
+    if (!music_playing_.load()) return;
+    size_t paused_at = music_bytes_downloaded_.load();
+    {
+        std::lock_guard<std::mutex> lock(music_url_mutex_);
+        music_resume_url_ = music_url_;
+    }
+    music_resume_bytes_ = paused_at;
+    ESP_LOGI(TAG, "PauseMusic: saving resume position at %u bytes", paused_at);
+    StopMusic();
+}
+
+bool AudioService::ResumeMusic() {
+    if (music_resume_url_.empty()) return false;
+    std::string url = music_resume_url_;
+    size_t offset = music_resume_bytes_;
+    music_resume_url_.clear();
+    music_resume_bytes_ = 0;
+    ESP_LOGI(TAG, "ResumeMusic: resuming from %u bytes", offset);
+    PlayMusicFromUrl(url, offset);
+    return true;
+}
+
+void AudioService::ClearMusicResume() {
+    music_resume_url_.clear();
+    music_resume_bytes_ = 0;
 }
 
 void AudioService::StopMusic() {
@@ -895,11 +925,13 @@ void AudioService::StopMusic() {
 
 void AudioService::MusicTask() {
     std::string url;
+    size_t start_offset;
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         url = music_url_;
+        start_offset = music_start_offset_;
     }
-    ESP_LOGI(TAG, "MusicTask: start streaming '%s'", url.c_str());
+    ESP_LOGI(TAG, "MusicTask: start streaming '%s' (offset=%u)", url.c_str(), start_offset);
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
@@ -920,15 +952,26 @@ void AudioService::MusicTask() {
         vTaskDelete(nullptr);
     };
 
+    // Set Range header for resume from a specific position
+    if (start_offset > 0) {
+        http->SetHeader("Range", "bytes=" + std::to_string(start_offset) + "-");
+        ESP_LOGI(TAG, "MusicTask: requesting Range: bytes=%u-", start_offset);
+    }
+
     if (!http->Open("GET", url)) {
         ESP_LOGE(TAG, "MusicTask: HTTP open failed");
         cleanup();
         return;
     }
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "MusicTask: HTTP status %d", http->GetStatusCode());
+    int status_code = http->GetStatusCode();
+    // Accept 200 (full content) and 206 (partial content for Range requests)
+    if (status_code != 200 && status_code != 206) {
+        ESP_LOGE(TAG, "MusicTask: HTTP status %d", status_code);
         cleanup();
         return;
+    }
+    if (status_code == 206) {
+        ESP_LOGI(TAG, "MusicTask: server supports range requests, resuming from %u bytes", start_offset);
     }
 
     // Create a dedicated Opus decoder for music (keeps TTS decoder untouched)
@@ -1043,6 +1086,8 @@ void AudioService::MusicTask() {
             break;
         }
         total_bytes += n;
+        // Update absolute byte position for pause/resume
+        music_bytes_downloaded_.store(start_offset + total_bytes);
         demuxer->Process(buf.data(), n);
         if (total_bytes % (100 * 1024) == 0) {  // Log every 100KB
             ESP_LOGD(TAG, "MusicTask: downloaded %u KB", total_bytes / 1024);

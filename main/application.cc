@@ -822,10 +822,11 @@ void Application::HandleWakeWordDetectedEvent() {
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
-    // Stop music when wake word is detected (user wants to talk)
+    // Pause music when wake word is detected (user wants to talk)
+    // Music position is saved so it can be resumed after the conversation
     if (audio_service_.IsMusicPlaying()) {
-        ESP_LOGI(TAG, "Stopping music due to wake word detection");
-        audio_service_.StopMusic();
+        ESP_LOGI(TAG, "Pausing music due to wake word detection");
+        audio_service_.PauseMusic();
     }
 
     if (state == kDeviceStateIdle) {
@@ -936,6 +937,11 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            // Auto-resume music if it was paused by a wake word interruption
+            if (audio_service_.HasMusicToResume()) {
+                ESP_LOGI(TAG, "Auto-resuming music after conversation");
+                Schedule([this]() { audio_service_.ResumeMusic(); });
+            }
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1201,9 +1207,12 @@ void Application::HandleMusicMessage(const cJSON* root) {
 
     const char* action_str = action->valuestring;
 
-    // Handle stop action
+    // Handle stop action — permanently stop, clear any saved resume state
     if (strcmp(action_str, "stop") == 0) {
-        Schedule([this]() { audio_service_.StopMusic(); });
+        Schedule([this]() {
+            audio_service_.StopMusic();
+            audio_service_.ClearMusicResume();
+        });
         return;
     }
 

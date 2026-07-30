@@ -138,8 +138,12 @@ public:
     void UpdateOutputTimestamp();
     void EnableOutputForMusic();
     void SetModelsList(srmodel_list_t* models_list);
-    void PlayMusicFromUrl(const std::string& url);
+    void PlayMusicFromUrl(const std::string& url, size_t start_offset = 0);
     void StopMusic();
+    void PauseMusic();                             // Save position and stop (wake word interrupt)
+    bool ResumeMusic();                            // Resume from saved position
+    bool HasMusicToResume() const { return !music_resume_url_.empty(); }
+    void ClearMusicResume();                       // Clear saved state (explicit user stop)
     bool IsMusicPlaying() const { return music_playing_.load(); }
 
 private:
@@ -177,9 +181,14 @@ private:
     std::atomic<bool> music_playing_{false};
     std::atomic<bool> music_abort_{false};
     std::string music_url_;
+    size_t music_start_offset_{0};                  // Byte offset for Range request
+    std::atomic<size_t> music_bytes_downloaded_{0}; // Absolute bytes downloaded (for pause)
     std::mutex music_url_mutex_;
     void* music_opus_decoder_ = nullptr;
     esp_ae_rate_cvt_handle_t music_resampler_ = nullptr;
+    // Music pause/resume state (set by PauseMusic, cleared by ResumeMusic/ClearMusicResume)
+    std::string music_resume_url_;
+    size_t music_resume_bytes_{0};
     std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
