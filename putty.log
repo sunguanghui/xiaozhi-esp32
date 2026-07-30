@@ -1,0 +1,69 @@
+=~=~=~=~=~=~=~=~=~=~=~= PuTTY log 2026.07.30 18:27:52 =~=~=~=~=~=~=~=~=~=~=~=
+ESP-ROM:esp32s3-20210327
+I (180686) SystemInfo: free sram: 85115 minimal sram: 79271
+I (190616) Application: Wake word detected: 你好小智 (state: 3)
+I (190616) StateMachine: State: idle -> connecting
+I (190616) WifiStation: Setting WiFi power save level: PERFORMANCE (NONE)
+I (190616) wifi:Set ps type: 0, coexist: 0
+
+I (190766) MQTT: Session ID: a79578c8
+I (190766) WifiStation: Setting WiFi power save level: PERFORMANCE (NONE)
+I (190766) wifi:Set ps type: 0, coexist: 0
+
+I (190776) Application: Wake word detected: 你好小智
+I (190866) AfeAudioEngine: Encoded wake word into 33 packets in 256 ms
+I (190876) StateMachine: State: connecting -> listening
+I (190886) AudioService: ResetDecoder: music_playing=false, cleared all 0 tasks
+I (191016) Application: >> 你好小智
+I (191066) StateMachine: State: listening -> speaking
+I (191066) AudioService: ResetDecoder: music_playing=false, cleared all 0 tasks
+I (192026) Application: << 哈啰你好呀！
+I (193686) Application: << 今天过得怎么样啊～
+I (195606) StateMachine: State: speaking -> listening
+I (195766) AudioService: ResetDecoder: music_playing=false, cleared all 0 tasks
+I (199776) Application: >> 播放周杰伦稻香。
+I (199786) StateMachine: State: listening -> speaking
+I (199846) AudioService: ResetDecoder: music_playing=false, cleared all 0 tasks
+I (200986) Application: << 好呀，我来播周杰伦的《稻香》给你听！
+I (204686) Application: << % self.music.search_and_play...
+I (204696) EspTcp: Resolved 8.153.171.156 -> 8.153.171.156
+I (204766) HttpClient: Established new connection to 8.153.171.156:18000 protocol=http cost=70
+I (205656) Application: << 已经帮你播《稻香》啦！
+I (206176) HttpClient: HTTP connection closed
+I (206176) Application: music search: playing http://8.153.171.156:18000/music/opus_stream?target=https%3A%2F%2Fcn-sccd-ct-02-18.bilivideo.com%2Fupgcxcode%2F19%2F38%2F550103819%2F550103819-1-30280.m4s%3Fe%3Dig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC7MTX502C8f2jmMQJ6mqF2fka1mqx6gqj0eN0B599M%3D%26deadline%3D1785414497%26uipk%3D5%26trid%3D00000a42eba9dd6c43dfa25d8cbffb8ebd8u%26oi%3D2105067452%26gen%3Dplayurlv3%26platform%3Dpc%26nbs%3D1%26os%3Dbcache%26og%3Dali%26mid%3D0%26upsig%3Db892a7386d66e43e128eb5b634040ddd%26uparams%3De%2Cdeadline%2Cuipk%2Ctrid%2Coi%2Cgen%2Cplatform%2Cnbs%2Cos%2Cog%2Cmid%26cdnid%3D89718%26bvc%3Dvod%26nettype%3D0%26bw%3D319804%26lrs%3D4%26f%3Du_0_0%26qn_dyeid%3Dc69d4e26df2e9447001d26b36a6b2741%26agrr%3D1%26buvid%3DB492C9CB-C68F-B36E-19D2-2A280D95655937656infoc%26build%3D0%26dl%3D0%26orderid%3D0%2C3&sig=74f8594f23f5f89d12c3463173afcdebdd68d7d5ff50a36cd47a0a79248283b4
+I (206256) AudioService: MusicTask: start streaming 'http://8.153.171.156:18000/music/opus_stream?target=https%3A%2F%2Fcn-sccd-ct-02-18.bilivideo.com%2Fupgcxcode%2F19%2F38%2F550103819%2F550103819-1-30280.m4s%3Fe%3Dig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC7MTX502C8f2jmMQJ6mqF2fka1mqx6gqj0eN0B599M%3D%26deadline%3D1785414497%26uipk%3D5%26trid%3D00000a42eba9dd6c43dfa25d8cbffb8ebd8u%26oi%3D2105067452%26gen%3Dplayurlv3%26platform%3Dpc%26nbs%3D1%26os%3Dbcache%26og%3Dali%26mid%3D0%26upsig%3Db892a7386d66e43e128eb5b634040ddd%26uparams%3De%2Cdeadline%2Cuipk%2Ctrid%2Coi%2Cgen%2Cplatform%2Cnbs%2Cos%2Cog%2Cmid%26cdnid%3D89718%26bvc%3Dvod%26nettype%3D0%26bw%3D319804%26lrs%3D4%26f%3Du_0_0%26qn_dyeid%3Dc69d4e26df2e9447001d26b36a6b2741%26agrr%3D1%26buvid%3DB492C9CB-C68F-B36E-19D2-2A280D95655937656infoc%26build%3D0%26dl%3D0%26orderid%3D0%2C3&sig=74f8594f23f5f89d12c3463173afcdebdd68d7d5ff50a36cd47a0a79248283b4'
+I (206346) EspTcp: Resolved 8.153.171.156 -> 8.153.171.156
+I (206406) HttpClient: Established new connection to 8.153.171.156:18000 protocol=http cost=60
+W (207746) MQTT: Received audio packet with wrong sequence: 152, expected: 148
+I (208006) Application: << 希望这首能让你心情好好喔～
+W (208016) MQTT: Received audio packet with wrong sequence: 158, expected: 155
+W (209106) MQTT: Received audio packet with wrong sequence: 172, expected: 164
+W (209196) MQTT: Received audio packet with wrong sequence: 176, expected: 174
+I (209686) SystemInfo: free sram: 56499 minimal sram: 52835
+I (211406) StateMachine: State: speaking -> listening
+I (211416) AudioService: StopMusic called
+W (211426) AudioService: MusicTask: task dropped (aborted)
+I (211426) AudioService: MusicTask: streaming finished, total=13 KB, aborted=1
+E (211426) HttpClient: Connection closed prematurely, expected 0 bytes but only received 22483 bytes
+I (211446) HttpClient: HTTP connection closed
+I (211446) AudioService: MusicTask: done
+I (211446) AudioService: ResetDecoder: music_playing=false, cleared all 0 tasks
+I (220686) SystemInfo: free sram: 78851 minimal sram: 52835
+I (230686) SystemInfo: free sram: 78615 minimal sram: 52835
+I (240686) SystemInfo: free sram: 78843 minimal sram: 52835
+I (250686) SystemInfo: free sram: 78615 minimal sram: 52835
+I (260686) SystemInfo: free sram: 78615 minimal sram: 52835
+I (270686) SystemInfo: free sram: 78615 minimal sram: 52835
+I (278626) StateMachine: State: listening -> speaking
+I (278626) AudioService: ResetDecoder: music_playing=false, cleared all 0 tasks
+I (279856) Application: << 好像没声音了，那我先挂啦，下次再聊喔～
+W (280116) MQTT: Received audio packet with wrong sequence: 209, expected: 202
+I (283476) Application: << 拜拜！
+I (284796) StateMachine: State: speaking -> listening
+I (284796) MQTT: Received goodbye message, session_id: a79578c8
+I (284796) MQTT: Closing audio channel, send_goodbye: 0
+I (284796) WifiStation: Setting WiFi power save level: LOW_POWER (MAX_MODEM)
+I (284806) wifi:Set ps type: 2, coexist: 0
+
+I (284816) StateMachine: State: listening -> idle
+I (284816) LcdDisplay: Chat messages cleared
