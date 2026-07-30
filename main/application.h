@@ -115,7 +115,6 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
-    void AddAudioData(AudioStreamPacket&& packet);
     
     /**
      * Reset protocol resources (thread-safe)
@@ -179,6 +178,9 @@ private:
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
+
+    // Bilibili music message handler
+    void HandleMusicMessage(const cJSON* root);
 };
 
 

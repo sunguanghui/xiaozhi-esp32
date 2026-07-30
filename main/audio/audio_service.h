@@ -138,6 +138,9 @@ public:
     void UpdateOutputTimestamp();
     void EnableOutputForMusic();
     void SetModelsList(srmodel_list_t* models_list);
+    void PlayMusicFromUrl(const std::string& url);
+    void StopMusic();
+    bool IsMusicPlaying() const { return music_playing_.load(); }
 
 private:
     AudioCodec* codec_ = nullptr;
@@ -169,6 +172,14 @@ private:
     TaskHandle_t audio_input_task_handle_ = nullptr;
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
+    // Music streaming
+    TaskHandle_t music_task_handle_ = nullptr;
+    std::atomic<bool> music_playing_{false};
+    std::atomic<bool> music_abort_{false};
+    std::string music_url_;
+    std::mutex music_url_mutex_;
+    void* music_opus_decoder_ = nullptr;
+    esp_ae_rate_cvt_handle_t music_resampler_ = nullptr;
     std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
@@ -200,6 +211,7 @@ private:
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
+    void MusicTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool InitializeAudioEngine();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);

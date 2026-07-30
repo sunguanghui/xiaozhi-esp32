@@ -19,6 +19,9 @@
 
 #define TAG "Application"
 
+// Bilibili Music API base URL (hardcoded; change here to point to a different instance)
+static constexpr char kBilibiliMusicApiBase[] = "http://8.153.171.156:18000";
+
 Application::Application() {
     event_group_ = xEventGroupCreate();
 
@@ -644,6 +647,8 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        } else if (strcmp(type->valuestring, "music") == 0) {
+            HandleMusicMessage(root);
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
@@ -905,6 +910,12 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
+    // Stop music whenever the device leaves idle (conversation takes priority)
+    if (new_state != kDeviceStateIdle && new_state != kDeviceStateUnknown) {
+        if (audio_service_.IsMusicPlaying()) {
+            audio_service_.StopMusic();
+        }
+    }
     clock_ticks_ = 0;
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
@@ -1179,44 +1190,152 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
-void Application::AddAudioData(AudioStreamPacket&& packet) {
-    auto codec = Board::GetInstance().GetAudioCodec();
-    if (state_machine_.GetState() != kDeviceStateIdle) {
+void Application::HandleMusicMessage(const cJSON* root) {
+    auto action = cJSON_GetObjectItem(root, "action");
+    if (!cJSON_IsString(action)) {
+        ESP_LOGW(TAG, "music: missing action field");
         return;
     }
-    if (packet.payload.size() < 2) {
+
+    const char* action_str = action->valuestring;
+
+    // Handle stop action
+    if (strcmp(action_str, "stop") == 0) {
+        Schedule([this]() { audio_service_.StopMusic(); });
         return;
     }
 
-    // Enable output if it was powered off (same as AudioService::PlaySound)
-    if (!codec->output_enabled()) {
-        audio_service_.EnableOutputForMusic();
+    // Handle direct play_url action
+    if (strcmp(action_str, "play_url") == 0) {
+        auto url = cJSON_GetObjectItem(root, "url");
+        if (!cJSON_IsString(url)) {
+            ESP_LOGW(TAG, "music: play_url requires url field");
+            return;
+        }
+        Schedule([this, url_str = std::string(url->valuestring)]() {
+            audio_service_.PlayMusicFromUrl(url_str);
+        });
+        return;
     }
 
-    size_t num_samples = packet.payload.size() / sizeof(int16_t);
-    std::vector<int16_t> pcm_data(num_samples);
-    memcpy(pcm_data.data(), packet.payload.data(), packet.payload.size());
+    // For search/trending: spawn background task to call Bilibili API
+    struct MusicSearchParams {
+        std::string action;
+        std::string keyword;
+        std::string time_range;
+    };
 
-    if (packet.sample_rate > 0 && packet.sample_rate != codec->output_sample_rate()) {
-        int in_rate  = packet.sample_rate;
-        int out_rate = codec->output_sample_rate();
-        size_t out_size = (size_t)((uint64_t)num_samples * out_rate / in_rate);
-        std::vector<int16_t> resampled(out_size);
-        for (size_t i = 0; i < out_size; ++i) {
-            float src = (float)i * in_rate / out_rate;
-            size_t idx = (size_t)src;
-            float frac = src - idx;
-            if (idx + 1 < num_samples) {
-                resampled[i] = (int16_t)(pcm_data[idx] + (pcm_data[idx + 1] - pcm_data[idx]) * frac);
-            } else {
-                resampled[i] = pcm_data[idx < num_samples ? idx : num_samples - 1];
+    auto* params = new MusicSearchParams();
+    params->action = action_str;
+
+    if (strcmp(action_str, "search") == 0) {
+        auto keyword = cJSON_GetObjectItem(root, "keyword");
+        if (!cJSON_IsString(keyword)) {
+            ESP_LOGW(TAG, "music: search requires keyword field");
+            delete params;
+            return;
+        }
+        params->keyword = keyword->valuestring;
+    } else if (strcmp(action_str, "trending") == 0) {
+        auto time_range = cJSON_GetObjectItem(root, "time_range");
+        params->time_range = cJSON_IsString(time_range) ? time_range->valuestring : "week";
+    } else {
+        ESP_LOGW(TAG, "music: unknown action: %s", action_str);
+        delete params;
+        return;
+    }
+
+    // Spawn background task (HTTP call must not block main/network thread)
+    xTaskCreate([](void* arg) {
+        auto* params = static_cast<MusicSearchParams*>(arg);
+
+        // Build API URL with proper encoding
+        std::string api_url;
+        if (params->action == "search") {
+            api_url = std::string(kBilibiliMusicApiBase) + "/music/search?keyword=";
+            // URL-encode keyword (simple implementation for common cases)
+            for (char c : params->keyword) {
+                if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                    api_url += c;
+                } else {
+                    char hex[4];
+                    snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
+                    api_url += hex;
+                }
+            }
+        } else if (params->action == "trending") {
+            api_url = std::string(kBilibiliMusicApiBase) + "/bili/trending?limit=1&time_range=" + params->time_range;
+        }
+
+        std::string action_copy = params->action;
+        delete params;
+
+        // HTTP GET request
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        if (!http->Open("GET", api_url)) {
+            ESP_LOGE(TAG, "music %s: HTTP open failed: %s", action_copy.c_str(), api_url.c_str());
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        int status_code = http->GetStatusCode();
+        if (status_code != 200) {
+            ESP_LOGE(TAG, "music %s: HTTP %d", action_copy.c_str(), status_code);
+            http->Close();
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        std::string response = http->ReadAll();
+        http->Close();
+
+        if (response.empty()) {
+            ESP_LOGW(TAG, "music %s: empty response", action_copy.c_str());
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        // Parse JSON response
+        cJSON* json = cJSON_Parse(response.c_str());
+        if (!json) {
+            ESP_LOGE(TAG, "music %s: JSON parse failed", action_copy.c_str());
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        // Extract first result URL from musicinfo[0].url
+        std::string proxy_url;
+        auto musicinfo = cJSON_GetObjectItem(json, "musicinfo");
+        if (cJSON_IsArray(musicinfo) && cJSON_GetArraySize(musicinfo) > 0) {
+            auto first = cJSON_GetArrayItem(musicinfo, 0);
+            auto url = cJSON_GetObjectItem(first, "url");
+            if (cJSON_IsString(url)) {
+                proxy_url = url->valuestring;
             }
         }
-        pcm_data = std::move(resampled);
-    }
+        cJSON_Delete(json);
 
-    codec->OutputData(pcm_data);
-    audio_service_.UpdateOutputTimestamp();
+        if (proxy_url.empty()) {
+            ESP_LOGW(TAG, "music %s: no results found", action_copy.c_str());
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        // Transform /music/proxy → /music/opus_stream (as per API doc)
+        const std::string from = "/music/proxy";
+        const std::string to   = "/music/opus_stream";
+        auto pos = proxy_url.find(from);
+        std::string opus_url = (pos != std::string::npos)
+            ? proxy_url.substr(0, pos) + to + proxy_url.substr(pos + from.size())
+            : proxy_url;
+
+        ESP_LOGI(TAG, "music %s: playing %s", action_copy.c_str(), opus_url.c_str());
+
+        // Play via AudioService (thread-safe via AudioService's internal queue)
+        Application::GetInstance().GetAudioService().PlayMusicFromUrl(opus_url);
+
+        vTaskDelete(nullptr);
+    }, "music_search", 8192, params, 5, nullptr);
 }
 
 void Application::ResetProtocol() {

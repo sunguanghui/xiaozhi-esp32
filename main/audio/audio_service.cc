@@ -834,3 +834,187 @@ void AudioService::EnableOutputForMusic() {
         codec_->EnableOutput(true);
     }
 }
+
+void AudioService::PlayMusicFromUrl(const std::string& url) {
+    // Stop any existing music and wait briefly for the task to exit
+    if (music_playing_.load() || music_task_handle_ != nullptr) {
+        music_abort_.store(true);
+        music_playing_.store(false);
+        for (int i = 0; i < 25 && music_task_handle_ != nullptr; i++) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(music_url_mutex_);
+        music_url_ = url;
+    }
+    music_abort_.store(false);
+    music_playing_.store(true);
+    EnableOutputForMusic();
+    xTaskCreate([](void* arg) {
+        static_cast<AudioService*>(arg)->MusicTask();
+    }, "music", 16384, this, 5, &music_task_handle_);
+}
+
+void AudioService::StopMusic() {
+    if (!music_playing_.load() && music_task_handle_ == nullptr) return;
+    ESP_LOGI(TAG, "StopMusic called");
+    music_abort_.store(true);
+    music_playing_.store(false);
+    // Drain any buffered music frames from the playback queue so the codec
+    // goes quiet immediately (best-effort; AudioOutputTask may have one
+    // in-flight frame that finishes naturally).
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        // Only remove AudioTask entries that were pushed by MusicTask
+        // (timestamp == 0 and type == kAudioTaskTypeDecodeToPlaybackQueue).
+        // In practice it's safest to leave the queue alone here and let
+        // ResetDecoder() handle it if the caller needs a hard flush.
+    }
+}
+
+void AudioService::MusicTask() {
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(music_url_mutex_);
+        url = music_url_;
+    }
+    ESP_LOGI(TAG, "MusicTask: start streaming '%s'", url.c_str());
+
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(3);
+
+    auto cleanup = [&]() {
+        http->Close();
+        if (music_opus_decoder_) {
+            esp_opus_dec_close(music_opus_decoder_);
+            music_opus_decoder_ = nullptr;
+        }
+        if (music_resampler_) {
+            esp_ae_rate_cvt_close(music_resampler_);
+            music_resampler_ = nullptr;
+        }
+        music_playing_.store(false);
+        music_task_handle_ = nullptr;
+        ESP_LOGI(TAG, "MusicTask: done");
+        vTaskDelete(nullptr);
+    };
+
+    if (!http->Open("GET", url)) {
+        ESP_LOGE(TAG, "MusicTask: HTTP open failed");
+        cleanup();
+        return;
+    }
+    if (http->GetStatusCode() != 200) {
+        ESP_LOGE(TAG, "MusicTask: HTTP status %d", http->GetStatusCode());
+        cleanup();
+        return;
+    }
+
+    // Create a dedicated Opus decoder for music (keeps TTS decoder untouched)
+    int current_sample_rate = 48000;
+    {
+        esp_opus_dec_cfg_t dec_cfg = OPUS_DEC_CFG(current_sample_rate, OPUS_FRAME_DURATION_MS);
+        esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &music_opus_decoder_);
+    }
+    if (!music_opus_decoder_) {
+        ESP_LOGE(TAG, "MusicTask: failed to open opus decoder");
+        cleanup();
+        return;
+    }
+
+    // Resampler if codec output rate differs from stream rate
+    auto maybe_open_resampler = [&](int src_rate) {
+        if (music_resampler_) {
+            esp_ae_rate_cvt_close(music_resampler_);
+            music_resampler_ = nullptr;
+        }
+        if (src_rate != codec_->output_sample_rate()) {
+            esp_ae_rate_cvt_cfg_t rcvt = RATE_CVT_CFG(src_rate, codec_->output_sample_rate(), 1);
+            esp_ae_rate_cvt_open(&rcvt, &music_resampler_);
+        }
+    };
+    maybe_open_resampler(current_sample_rate);
+
+    // OggDemuxer: synchronous callbacks fired from Process()
+    auto demuxer = std::make_unique<OggDemuxer>();
+    demuxer->OnDemuxerFinished([&](const uint8_t* data, int sample_rate, size_t len) {
+        if (music_abort_.load()) return;
+
+        // Reconfigure decoder and resampler when the stream's sample rate is known
+        if (sample_rate != current_sample_rate) {
+            current_sample_rate = sample_rate;
+            esp_opus_dec_close(music_opus_decoder_);
+            music_opus_decoder_ = nullptr;
+            esp_opus_dec_cfg_t new_cfg = OPUS_DEC_CFG(sample_rate, OPUS_FRAME_DURATION_MS);
+            esp_opus_dec_open(&new_cfg, sizeof(new_cfg), &music_opus_decoder_);
+            if (!music_opus_decoder_) { music_abort_.store(true); return; }
+            maybe_open_resampler(sample_rate);
+        }
+
+        // Decode Opus packet → PCM
+        constexpr size_t kMaxPcmSamples = 48000 / 1000 * OPUS_FRAME_DURATION_MS;
+        std::vector<int16_t> pcm(kMaxPcmSamples);
+        esp_audio_dec_in_raw_t raw = {
+            .buffer        = const_cast<uint8_t*>(data),
+            .len           = (uint32_t)len,
+            .consumed      = 0,
+            .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+        };
+        esp_audio_dec_out_frame_t out_frame = {
+            .buffer = (uint8_t*)pcm.data(),
+            .len    = (uint32_t)(pcm.size() * sizeof(int16_t)),
+            .decoded_size = 0,
+        };
+        esp_audio_dec_info_t dec_info = {};
+        auto ret = esp_opus_dec_decode(music_opus_decoder_, &raw, &out_frame, &dec_info);
+        if (ret != ESP_AUDIO_ERR_OK) {
+            ESP_LOGW(TAG, "MusicTask: opus decode err %d", ret);
+            return;
+        }
+        pcm.resize(out_frame.decoded_size / sizeof(int16_t));
+
+        // Resample to codec output rate if needed
+        if (music_resampler_ != nullptr) {
+            uint32_t max_out = 0;
+            esp_ae_rate_cvt_get_max_out_sample_num(music_resampler_, pcm.size(), &max_out);
+            std::vector<int16_t> resampled(max_out);
+            uint32_t actual_out = max_out;
+            esp_ae_rate_cvt_process(music_resampler_,
+                                    (esp_ae_sample_t)pcm.data(), pcm.size(),
+                                    (esp_ae_sample_t)resampled.data(), &actual_out);
+            resampled.resize(actual_out);
+            pcm = std::move(resampled);
+        }
+
+        // Push decoded PCM into the shared playback queue.
+        // Block until there is space or until we are aborted.
+        auto task = std::make_unique<AudioTask>();
+        task->type      = kAudioTaskTypeDecodeToPlaybackQueue;
+        task->timestamp = 0;
+        task->pcm       = std::move(pcm);
+
+        while (!music_abort_.load()) {
+            std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+            if (audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+                audio_playback_queue_.push_back(std::move(task));
+                audio_queue_cv_.notify_all();
+                return;
+            }
+            lock.unlock();
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        // aborted — task is dropped
+    });
+    demuxer->Reset();
+
+    constexpr size_t kBufSize = 4096;
+    std::vector<uint8_t> buf(kBufSize);
+    while (!music_abort_.load()) {
+        int n = http->Read(reinterpret_cast<char*>(buf.data()), kBufSize);
+        if (n <= 0) break;
+        demuxer->Process(buf.data(), n);
+    }
+
+    cleanup();
+}
