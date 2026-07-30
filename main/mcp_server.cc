@@ -121,6 +121,92 @@ void McpServer::AddCommonTools() {
     }
 #endif
 
+    // Music playback tools
+    AddTool("self.music.search_and_play",
+        "Search for music on Bilibili and play the first result. Use this tool when the user asks to play a song by name or artist.\n"
+        "Args:\n"
+        "  `keyword`: The search keyword (song name, artist name, or both).\n"
+        "  `time_range`: Optional time range filter. Can be 'day', 'week', 'month', or 'all'. Default is 'week'.\n"
+        "Return:\n"
+        "  A boolean indicating success or failure.",
+        PropertyList({
+            Property("keyword", kPropertyTypeString),
+            Property("time_range", kPropertyTypeString, std::string("week"))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto keyword = properties["keyword"].value<std::string>();
+            auto time_range = properties["time_range"].value<std::string>();
+
+            // Create music message to send to application
+            cJSON* message = cJSON_CreateObject();
+            cJSON_AddStringToObject(message, "type", "music");
+            cJSON_AddStringToObject(message, "action", "search");
+            cJSON_AddStringToObject(message, "keyword", keyword.c_str());
+            cJSON_AddStringToObject(message, "time_range", time_range.c_str());
+
+            // Convert to string and send via protocol
+            char* json_str = cJSON_PrintUnformatted(message);
+            auto& app = Application::GetInstance();
+            app.HandleMusicMessage(message);
+
+            cJSON_free(json_str);
+            cJSON_Delete(message);
+
+            return true;
+        });
+
+    AddTool("self.music.play_url",
+        "Play music from a direct URL. The URL should point to an audio file or stream (supports mp3, ogg, opus, etc.).\n"
+        "Args:\n"
+        "  `url`: The direct URL of the audio file or stream.\n"
+        "Return:\n"
+        "  A boolean indicating success or failure.",
+        PropertyList({
+            Property("url", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto url = properties["url"].value<std::string>();
+
+            // Create music message to send to application
+            cJSON* message = cJSON_CreateObject();
+            cJSON_AddStringToObject(message, "type", "music");
+            cJSON_AddStringToObject(message, "action", "play_url");
+            cJSON_AddStringToObject(message, "url", url.c_str());
+
+            // Send via application
+            auto& app = Application::GetInstance();
+            app.HandleMusicMessage(message);
+
+            cJSON_Delete(message);
+
+            return true;
+        });
+
+    AddTool("self.music.stop",
+        "Stop the currently playing music.\n"
+        "Return:\n"
+        "  A boolean indicating success or failure.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            app.GetAudioService().StopMusic();
+            return true;
+        });
+
+    AddTool("self.music.get_status",
+        "Get the current music playback status.\n"
+        "Return:\n"
+        "  A JSON object with the music status (playing: true/false).",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            bool is_playing = app.GetAudioService().IsMusicPlaying();
+
+            cJSON* json = cJSON_CreateObject();
+            cJSON_AddBoolToObject(json, "playing", is_playing);
+            return json;
+        });
+
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
 }
