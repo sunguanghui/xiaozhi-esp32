@@ -1080,8 +1080,6 @@ void AudioService::MusicTask() {
             break;
         }
         total_bytes += n;
-        // Update absolute byte position for pause/resume
-        music_bytes_downloaded_.store(start_offset + total_bytes);
         demuxer->Process(buf.data(), n);
         if (total_bytes % (100 * 1024) == 0) {  // Log every 100KB
             ESP_LOGD(TAG, "MusicTask: downloaded %u KB", total_bytes / 1024);
