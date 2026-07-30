@@ -752,7 +752,22 @@ void AudioService::ResetDecoder() {
         decoder_lock.unlock();
         timestamp_queue_.clear();
         audio_decode_queue_.clear();
-        audio_playback_queue_.clear();
+
+        // Clear playback queue but preserve music tasks (timestamp == 0)
+        if (music_playing_.load()) {
+            // Keep music tasks in playback queue, remove only TTS tasks
+            audio_playback_queue_.erase(
+                std::remove_if(audio_playback_queue_.begin(), audio_playback_queue_.end(),
+                    [](const std::unique_ptr<AudioTask>& task) {
+                        return task->timestamp != 0;  // Remove TTS tasks (timestamp != 0)
+                    }),
+                audio_playback_queue_.end()
+            );
+        } else {
+            // No music playing, clear everything
+            audio_playback_queue_.clear();
+        }
+
         audio_testing_queue_.clear();
         notify_drained = MarkPlaybackDrainedLocked();
         audio_queue_cv_.notify_all();
