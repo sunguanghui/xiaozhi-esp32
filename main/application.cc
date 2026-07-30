@@ -910,8 +910,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
-    // Stop music whenever the device leaves idle (conversation takes priority)
-    if (new_state != kDeviceStateIdle && new_state != kDeviceStateUnknown) {
+    // Stop music only when user starts listening (conversation takes priority)
+    // Don't stop music when AI is speaking - let music continue playing
+    if (new_state == kDeviceStateListening) {
         if (audio_service_.IsMusicPlaying()) {
             audio_service_.StopMusic();
         }
