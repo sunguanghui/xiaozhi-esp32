@@ -1216,6 +1216,19 @@ void Application::HandleMusicMessage(const cJSON* root) {
         }
         Schedule([this, url_str = std::string(url->valuestring)]() {
             audio_service_.PlayMusicFromUrl(url_str);
+
+            // Close the audio channel after a short delay to prevent AI from continuing to talk
+            Schedule([this]() {
+                vTaskDelay(pdMS_TO_TICKS(1000));  // Wait 1 second for music to start
+                if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                    ESP_LOGI(TAG, "Closing audio channel to prevent TTS during music playback");
+                    protocol_->CloseAudioChannel(false);  // Don't send goodbye
+                }
+                DeviceState state = GetDeviceState();
+                if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+                    SetDeviceState(kDeviceStateIdle);
+                }
+            });
         });
         return;
     }
@@ -1334,7 +1347,22 @@ void Application::HandleMusicMessage(const cJSON* root) {
         ESP_LOGI(TAG, "music %s: playing %s", action_copy.c_str(), opus_url.c_str());
 
         // Play via AudioService (thread-safe via AudioService's internal queue)
-        Application::GetInstance().GetAudioService().PlayMusicFromUrl(opus_url);
+        auto& app = Application::GetInstance();
+        app.GetAudioService().PlayMusicFromUrl(opus_url);
+
+        // Close the audio channel after a short delay to prevent AI from continuing to talk
+        // This avoids TTS interrupting the music playback
+        app.Schedule([&app]() {
+            vTaskDelay(pdMS_TO_TICKS(1000));  // Wait 1 second for music to start
+            if (app.protocol_ && app.protocol_->IsAudioChannelOpened()) {
+                ESP_LOGI(TAG, "Closing audio channel to prevent TTS during music playback");
+                app.protocol_->CloseAudioChannel(false);  // Don't send goodbye
+            }
+            DeviceState state = app.GetDeviceState();
+            if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+        });
 
         vTaskDelete(nullptr);
     }, "music_search", 8192, params, 5, nullptr);
