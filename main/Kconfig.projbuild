@@ -15,6 +15,15 @@ config MUSIC_API_BASE_URL
         firmware does not validate this value at build time.
         Prefer an HTTPS endpoint when possible.
 
+config RADIO_API_BASE_URL
+    string "Radio API base URL"
+    default "http://8.153.171.156:12300"
+    help
+        Base URL of the radio search/stream service used by the built-in radio MCP
+        tools. The service provides Ogg/Opus streams so the firmware does not need
+        to decode MP3/AAC/HLS itself.
+        Prefer an HTTPS endpoint when possible.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

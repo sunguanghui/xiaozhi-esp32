@@ -12,6 +12,7 @@
 #include <deque>
 #include <memory>
 #include <functional>
+#include <vector>
 
 #include "protocol.h"
 #include "ota.h"
@@ -42,6 +43,29 @@ enum AecMode {
     kAecOff,
     kAecOnDeviceSide,
     kAecOnServerSide,
+};
+
+// Album/episode information for the audiobook currently loaded by the user.
+// Audiobooks are streamed through the same AudioService path as music.
+struct AudiobookStatus {
+    std::string album_title;
+    std::string bvid;
+    int current_episode = 0;  // 1-based, 0 when no album is loaded
+    int total_episodes = 0;
+};
+
+// A live radio station returned by the radio service. play_url is a signed
+// Ogg/Opus stream, so it can be handed to AudioService directly.
+struct RadioStation {
+    std::string name;
+    std::string play_url;
+};
+
+struct RadioStatus {
+    std::string query;
+    std::string station_name;
+    int station_index = 0;  // 1-based current station, 0 when none
+    int total_stations = 0;
 };
 
 class Application {
@@ -133,6 +157,73 @@ public:
     void HandleMusicMessage(const cJSON* root);
 
     /**
+     * Handle an audiobook message (server "audiobook" type or MCP tools).
+     * Actions: search, resolve, next, stop.
+     * Safe to call from any task; HTTP work runs in a background task.
+     */
+    void HandleAudiobookMessage(const cJSON* root);
+
+    /**
+     * Search Bilibili for an audiobook and play the given episode (1-based).
+     * Safe to call from any task.
+     */
+    void SearchAndPlayAudiobook(const std::string& keyword, int episode = 1);
+
+    /**
+     * Play an episode of the album identified by bvid (1-based).
+     * Safe to call from any task.
+     */
+    void PlayAudiobookEpisode(const std::string& bvid, int episode = 1);
+
+    /**
+     * Play the next episode of the currently loaded audiobook album.
+     * Returns false when no album is loaded or the last episode is current.
+     */
+    bool PlayNextAudiobookEpisode();
+
+    /**
+     * Copy the currently loaded album information. Returns false when no
+     * album has been loaded (or after the audiobook was stopped).
+     */
+    bool GetAudiobookStatus(AudiobookStatus* status) const;
+
+    /**
+     * Forget the loaded album and discard any in-flight audiobook request.
+     * Safe to call from any task.
+     */
+    void ClearAudiobookStatus();
+
+    /**
+     * Handle a radio message (server "radio" type or MCP tools).
+     * Actions: play, next, stop.
+     * Safe to call from any task; HTTP work runs in a background task.
+     */
+    void HandleRadioMessage(const cJSON* root);
+
+    /**
+     * Search the radio service and play the first live station.
+     * Safe to call from any task.
+     */
+    void SearchAndPlayRadio(const std::string& query);
+
+    /**
+     * Switch to the next station from the last search results (wraps around).
+     * Returns false when no station list is loaded.
+     */
+    bool PlayNextRadioStation();
+
+    /**
+     * Copy the current radio status. Returns false when no station is loaded.
+     */
+    bool GetRadioStatus(RadioStatus* status) const;
+
+    /**
+     * Forget the current station list and discard any in-flight radio request.
+     * Safe to call from any task.
+     */
+    void ClearRadioStatus();
+
+    /**
      * Permanently stop music and cancel any pending wake-word resume.
      * Safe to call from any task.
      */
@@ -157,6 +248,24 @@ private:
     esp_timer_handle_t music_resume_timer_ = nullptr;
     esp_timer_handle_t server_goodbye_timer_ = nullptr;
     std::atomic<bool> server_goodbye_pending_{false};
+    // Audiobook album state, used by the "next episode" tool. Guarded by
+    // audiobook_mutex_ because MCP/network threads read it while background
+    // requests update it. audiobook_generation_ invalidates in-flight results
+    // when the user starts another album/track or stops playback.
+    mutable std::mutex audiobook_mutex_;
+    uint32_t audiobook_generation_ = 0;
+    std::string audiobook_keyword_;
+    std::string audiobook_bvid_;
+    std::string audiobook_album_title_;
+    int audiobook_current_episode_ = 0;
+    int audiobook_total_episodes_ = 0;
+    // Live radio state. The list holds the stations (with their signed Opus
+    // play URLs) from the last search so "next station" does not search again.
+    mutable std::mutex radio_mutex_;
+    uint32_t radio_generation_ = 0;
+    std::string radio_query_;
+    std::vector<RadioStation> radio_stations_;
+    int radio_station_index_ = 0;
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
@@ -191,6 +300,11 @@ private:
     void HandleMusicResumeCheckEvent();
     void HandleServerGoodbyeCheckEvent();
     void CancelPendingMusicResume();
+    void StartAudiobookRequest(bool search_by_keyword, const std::string& query, int episode);
+    void AudiobookRequestTask(bool search_by_keyword, std::string query, int episode,
+                              uint32_t generation);
+    void StartRadioRequest(const std::string& query);
+    void RadioRequestTask(std::string query, uint32_t generation);
     void CloseMusicSessionSoon();
     void CloseMusicSession();
     void ContinueOpenAudioChannel(ListeningMode mode);

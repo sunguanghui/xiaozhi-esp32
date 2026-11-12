@@ -215,6 +215,166 @@ void McpServer::AddCommonTools() {
             return json;
         });
 
+    // Audiobook playback tools. Audiobooks use the same streaming/decoder path
+    // as music, so pause/resume/stop semantics are identical.
+    AddTool("self.audiobook.search_and_play",
+        "Search Bilibili for an audiobook/album and start playing it.\n"
+        "Use this tool when the user asks to listen to an audiobook, audiobook novel (有声书/有声小说), "
+        "or a named multi-episode album.\n"
+        "Args:\n"
+        "  `keyword`: The album name, e.g. '明朝那些事儿 有声书'.\n"
+        "  `episode`: Episode number to start from, 1-based. Default is 1.\n"
+        "Return:\n"
+        "  true if the playback request was accepted. Search and playback run asynchronously.",
+        PropertyList({
+            Property("keyword", kPropertyTypeString),
+            Property("episode", kPropertyTypeInteger, 1, 1, 9999)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto keyword = properties["keyword"].value<std::string>();
+            int episode = properties["episode"].value<int>();
+            Application::GetInstance().SearchAndPlayAudiobook(keyword, episode);
+            return true;
+        });
+
+    AddTool("self.audiobook.next",
+        "Play the next episode of the audiobook album that is currently loaded.\n"
+        "Use this tool when the user asks for the next episode/chapter (下一集/下一章).\n"
+        "Return:\n"
+        "  true if the next episode request was accepted; false when no album is loaded "
+        "or the current episode is the last one.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            return Application::GetInstance().PlayNextAudiobookEpisode();
+        });
+
+    AddTool("self.audiobook.play_episode",
+        "Play a specific episode of the audiobook album that is currently loaded.\n"
+        "Use this tool when the user names an episode number (第N集).\n"
+        "Args:\n"
+        "  `episode`: Episode number, 1-based.\n"
+        "Return:\n"
+        "  true if the request was accepted; false when no album is loaded.",
+        PropertyList({
+            Property("episode", kPropertyTypeInteger, 1, 1, 9999)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            AudiobookStatus status;
+            if (!app.GetAudiobookStatus(&status)) {
+                return false;
+            }
+            app.PlayAudiobookEpisode(status.bvid, properties["episode"].value<int>());
+            return true;
+        });
+
+    AddTool("self.audiobook.get_status",
+        "Get the audiobook album and playback status.\n"
+        "Return:\n"
+        "  A JSON object: {album_title, bvid, current_episode, total_episodes, playing, paused}.\n"
+        "  current_episode is 0 when no album is loaded.\n"
+        "  playing=true means audio is actively playing; paused=true means it was interrupted "
+        "and may resume after the conversation.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            AudiobookStatus status;
+            bool has_album = app.GetAudiobookStatus(&status);
+            bool is_playing = app.GetAudioService().IsMusicPlaying();
+            bool is_paused = !is_playing && app.GetAudioService().HasMusicToResume();
+
+            cJSON* json = cJSON_CreateObject();
+            cJSON_AddStringToObject(json, "album_title", has_album ? status.album_title.c_str() : "");
+            cJSON_AddStringToObject(json, "bvid", has_album ? status.bvid.c_str() : "");
+            cJSON_AddNumberToObject(json, "current_episode", has_album ? status.current_episode : 0);
+            cJSON_AddNumberToObject(json, "total_episodes", has_album ? status.total_episodes : 0);
+            cJSON_AddBoolToObject(json, "playing", is_playing);
+            cJSON_AddBoolToObject(json, "paused", is_paused);
+            return json;
+        });
+
+    AddTool("self.audiobook.stop",
+        "Stop audiobook playback and forget the current album/episode.\n"
+        "Use this tool when the user wants to stop listening to an audiobook.\n"
+        "Return:\n"
+        "  true.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            app.StopMusicPermanently();
+            app.ClearAudiobookStatus();
+            return true;
+        });
+
+    // Live radio tools. The radio service returns signed Ogg/Opus streams, so
+    // playback uses the same AudioService path as music.
+    AddTool("self.radio.search_and_play",
+        "Search live radio stations by name/genre and start playing the first match.\n"
+        "Use this tool when the user asks to listen to the radio, a radio station, a broadcast, "
+        "or a named station (广播/电台/收音机).\n"
+        "Args:\n"
+        "  `keyword`: Station name, genre or keyword, e.g. '中国之声', 'jazz', '新闻广播'.\n"
+        "Return:\n"
+        "  true if the request was accepted. Search and playback run asynchronously.",
+        PropertyList({
+            Property("keyword", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto keyword = properties["keyword"].value<std::string>();
+            Application::GetInstance().SearchAndPlayRadio(keyword);
+            return true;
+        });
+
+    AddTool("self.radio.next",
+        "Switch to the next live radio station from the last search results.\n"
+        "Use this tool when the user asks for another station or the next one (下一个台/换一个).\n"
+        "Return:\n"
+        "  true if the station was switched; false when no station list is loaded.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            return Application::GetInstance().PlayNextRadioStation();
+        });
+
+    AddTool("self.radio.get_status",
+        "Get the current live radio status.\n"
+        "Return:\n"
+        "  A JSON object: {active, query, station_name, station_index, total_stations, playing, paused}.\n"
+        "  station_index is 1-based and 0 when no station is loaded.\n"
+        "  playing=true means audio is actively playing; paused=true means it was interrupted "
+        "and may resume after the conversation.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            RadioStatus status;
+            bool has_station = app.GetRadioStatus(&status);
+            bool is_playing = app.GetAudioService().IsMusicPlaying();
+            bool is_paused = !is_playing && app.GetAudioService().HasMusicToResume();
+
+            cJSON* json = cJSON_CreateObject();
+            cJSON_AddBoolToObject(json, "active", has_station);
+            cJSON_AddStringToObject(json, "query", has_station ? status.query.c_str() : "");
+            cJSON_AddStringToObject(json, "station_name",
+                                    has_station ? status.station_name.c_str() : "");
+            cJSON_AddNumberToObject(json, "station_index", has_station ? status.station_index : 0);
+            cJSON_AddNumberToObject(json, "total_stations", has_station ? status.total_stations : 0);
+            cJSON_AddBoolToObject(json, "playing", is_playing);
+            cJSON_AddBoolToObject(json, "paused", is_paused);
+            return json;
+        });
+
+    AddTool("self.radio.stop",
+        "Stop radio playback and forget the current station list.\n"
+        "Use this tool when the user wants to stop listening to the radio.\n"
+        "Return:\n"
+        "  true.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            app.StopMusicPermanently();
+            app.ClearRadioStatus();
+            return true;
+        });
+
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
 }

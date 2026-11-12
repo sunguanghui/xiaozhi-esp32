@@ -15,7 +15,9 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
+#include <cctype>
 #include <cstring>
+#include <utility>
 
 #define TAG "Application"
 
@@ -24,6 +26,12 @@
 #define CONFIG_MUSIC_API_BASE_URL "http://8.153.171.156:18000"
 #endif
 static constexpr char kBilibiliMusicApiBase[] = CONFIG_MUSIC_API_BASE_URL;
+
+// Radio search/stream service. Override with `config RADIO_API_BASE_URL`.
+#ifndef CONFIG_RADIO_API_BASE_URL
+#define CONFIG_RADIO_API_BASE_URL "http://8.153.171.156:12300"
+#endif
+static constexpr char kRadioApiBase[] = CONFIG_RADIO_API_BASE_URL;
 
 namespace {
 
@@ -36,6 +44,39 @@ std::string SanitizeUrlForLog(const std::string& url) {
     }
     return url.substr(0, query) + "?<redacted>";
 }
+
+std::string UrlEncode(const std::string& value) {
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(value.size() * 3);
+    for (unsigned char c : value) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += static_cast<char>(c);
+        } else {
+            encoded += '%';
+            encoded += kHex[c >> 4];
+            encoded += kHex[c & 0x0F];
+        }
+    }
+    return encoded;
+}
+
+// Parameters handed to the audiobook HTTP task. The task must not touch
+// Application state directly on the network thread, so parsed results are
+// posted back through Application::Schedule().
+struct AudiobookRequest {
+    Application* app;
+    bool search_by_keyword;
+    std::string query;  // keyword when searching, bvid otherwise
+    int episode;
+    uint32_t generation;
+};
+
+struct RadioRequest {
+    Application* app;
+    std::string query;
+    uint32_t generation;
+};
 
 }  // namespace
 
@@ -705,6 +746,10 @@ void Application::InitializeProtocol() {
 #endif
         } else if (strcmp(type->valuestring, "music") == 0) {
             HandleMusicMessage(root);
+        } else if (strcmp(type->valuestring, "audiobook") == 0) {
+            HandleAudiobookMessage(root);
+        } else if (strcmp(type->valuestring, "radio") == 0) {
+            HandleRadioMessage(root);
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
@@ -1384,6 +1429,9 @@ void Application::HandleMusicMessage(const cJSON* root) {
             return;
         }
         Schedule([this, url_str = std::string(url->valuestring)]() {
+            // A plain track replaces any audiobook album or radio station.
+            ClearAudiobookStatus();
+            ClearRadioStatus();
             CancelPendingMusicResume();
             audio_service_.PlayMusicFromUrl(url_str);
             // The delay runs in a background task, not on the main event loop.
@@ -1426,17 +1474,8 @@ void Application::HandleMusicMessage(const cJSON* root) {
         // Build API URL with proper encoding
         std::string api_url;
         if (params->action == "search") {
-            api_url = std::string(kBilibiliMusicApiBase) + "/music/search?keyword=";
-            // URL-encode keyword (simple implementation for common cases)
-            for (char c : params->keyword) {
-                if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-                    api_url += c;
-                } else {
-                    char hex[4];
-                    snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
-                    api_url += hex;
-                }
-            }
+            api_url = std::string(kBilibiliMusicApiBase) + "/music/search?keyword=" +
+                      UrlEncode(params->keyword);
         } else if (params->action == "trending") {
             api_url = std::string(kBilibiliMusicApiBase) + "/bili/trending?limit=1&time_range=" + params->time_range;
         }
@@ -1511,6 +1550,9 @@ void Application::HandleMusicMessage(const cJSON* root) {
         // transient stack reference is captured.
         Application::GetInstance().Schedule([opus_url]() {
             auto& app = Application::GetInstance();
+            // A plain track replaces any audiobook album or radio station.
+            app.ClearAudiobookStatus();
+            app.ClearRadioStatus();
             app.CancelPendingMusicResume();
             app.GetAudioService().PlayMusicFromUrl(opus_url);
             // The delay runs in a background task, not on the main loop.
@@ -1519,6 +1561,464 @@ void Application::HandleMusicMessage(const cJSON* root) {
 
         vTaskDelete(nullptr);
     }, "music_search", 8192, params, 5, nullptr);
+}
+
+void Application::HandleAudiobookMessage(const cJSON* root) {
+    auto action = cJSON_GetObjectItem(root, "action");
+    if (!cJSON_IsString(action)) {
+        ESP_LOGW(TAG, "audiobook: missing action field");
+        return;
+    }
+
+    const char* action_str = action->valuestring;
+
+    if (strcmp(action_str, "stop") == 0) {
+        StopMusicPermanently();
+        ClearAudiobookStatus();
+        return;
+    }
+
+    if (strcmp(action_str, "next") == 0) {
+        if (!PlayNextAudiobookEpisode()) {
+            ESP_LOGW(TAG, "audiobook: no album loaded or already at the last episode");
+        }
+        return;
+    }
+
+    if (strcmp(action_str, "search") == 0) {
+        auto keyword = cJSON_GetObjectItem(root, "keyword");
+        if (!cJSON_IsString(keyword) || keyword->valuestring[0] == '\0') {
+            ESP_LOGW(TAG, "audiobook: search requires a non-empty keyword field");
+            return;
+        }
+        auto episode = cJSON_GetObjectItem(root, "episode");
+        SearchAndPlayAudiobook(keyword->valuestring,
+                               cJSON_IsNumber(episode) ? episode->valueint : 1);
+        return;
+    }
+
+    if (strcmp(action_str, "resolve") == 0) {
+        auto bvid = cJSON_GetObjectItem(root, "bvid");
+        if (!cJSON_IsString(bvid) || bvid->valuestring[0] == '\0') {
+            ESP_LOGW(TAG, "audiobook: resolve requires a non-empty bvid field");
+            return;
+        }
+        auto episode = cJSON_GetObjectItem(root, "episode");
+        PlayAudiobookEpisode(bvid->valuestring,
+                             cJSON_IsNumber(episode) ? episode->valueint : 1);
+        return;
+    }
+
+    ESP_LOGW(TAG, "audiobook: unknown action: %s", action_str);
+}
+
+void Application::SearchAndPlayAudiobook(const std::string& keyword, int episode) {
+    if (keyword.empty()) {
+        ESP_LOGW(TAG, "audiobook: empty search keyword");
+        return;
+    }
+    StartAudiobookRequest(true, keyword, episode);
+}
+
+void Application::PlayAudiobookEpisode(const std::string& bvid, int episode) {
+    if (bvid.empty()) {
+        ESP_LOGW(TAG, "audiobook: empty bvid");
+        return;
+    }
+    StartAudiobookRequest(false, bvid, episode);
+}
+
+bool Application::PlayNextAudiobookEpisode() {
+    std::string bvid;
+    int next_episode = 0;
+    {
+        std::lock_guard<std::mutex> lock(audiobook_mutex_);
+        if (audiobook_bvid_.empty() || audiobook_total_episodes_ <= 0 ||
+            audiobook_current_episode_ < 1 ||
+            audiobook_current_episode_ >= audiobook_total_episodes_) {
+            return false;
+        }
+        bvid = audiobook_bvid_;
+        next_episode = audiobook_current_episode_ + 1;
+    }
+    StartAudiobookRequest(false, bvid, next_episode);
+    return true;
+}
+
+bool Application::GetAudiobookStatus(AudiobookStatus* status) const {
+    if (status == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(audiobook_mutex_);
+    if (audiobook_bvid_.empty() && audiobook_album_title_.empty()) {
+        return false;
+    }
+    status->album_title = audiobook_album_title_;
+    status->bvid = audiobook_bvid_;
+    status->current_episode = audiobook_current_episode_;
+    status->total_episodes = audiobook_total_episodes_;
+    return true;
+}
+
+void Application::ClearAudiobookStatus() {
+    std::lock_guard<std::mutex> lock(audiobook_mutex_);
+    // Invalidate any in-flight /audio/search or /audio/resolve result.
+    ++audiobook_generation_;
+    audiobook_keyword_.clear();
+    audiobook_bvid_.clear();
+    audiobook_album_title_.clear();
+    audiobook_current_episode_ = 0;
+    audiobook_total_episodes_ = 0;
+}
+
+void Application::StartAudiobookRequest(bool search_by_keyword, const std::string& query,
+                                        int episode) {
+    uint32_t generation;
+    {
+        std::lock_guard<std::mutex> lock(audiobook_mutex_);
+        generation = ++audiobook_generation_;
+    }
+
+    auto* request = new AudiobookRequest{
+        this, search_by_keyword, query, episode < 1 ? 1 : episode, generation};
+
+    BaseType_t created = xTaskCreate(
+        [](void* arg) {
+            auto* request = static_cast<AudiobookRequest*>(arg);
+            auto* app = request->app;
+            bool search_by_keyword = request->search_by_keyword;
+            std::string query = std::move(request->query);
+            int episode = request->episode;
+            uint32_t generation = request->generation;
+            delete request;
+            app->AudiobookRequestTask(search_by_keyword, std::move(query), episode, generation);
+            vTaskDelete(nullptr);
+        },
+        "audiobook", 8192, request, 5, nullptr);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "audiobook: failed to create request task");
+        delete request;
+    }
+}
+
+void Application::AudiobookRequestTask(bool search_by_keyword, std::string query, int episode,
+                                       uint32_t generation) {
+    std::string api_url = kBilibiliMusicApiBase;
+    if (search_by_keyword) {
+        api_url += "/audio/search?keyword=" + UrlEncode(query) +
+                   "&episode=" + std::to_string(episode);
+    } else {
+        api_url += "/audio/resolve?bvid=" + UrlEncode(query) +
+                   "&episode=" + std::to_string(episode);
+    }
+
+    const char* action = search_by_keyword ? "search" : "resolve";
+    // This URL carries a keyword or bvid only, so it is safe to log in full.
+    ESP_LOGI(TAG, "audiobook %s: GET %s", action, api_url.c_str());
+
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        ESP_LOGE(TAG, "audiobook %s: network unavailable", action);
+        return;
+    }
+
+    auto http = network->CreateHttp(3);
+    if (!http->Open("GET", api_url)) {
+        ESP_LOGE(TAG, "audiobook %s: HTTP open failed", action);
+        return;
+    }
+
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "audiobook %s: HTTP %d", action, status_code);
+        http->Close();
+        return;
+    }
+
+    std::string response = http->ReadAll();
+    http->Close();
+
+    if (response.empty()) {
+        ESP_LOGW(TAG, "audiobook %s: empty response", action);
+        return;
+    }
+
+    cJSON* json = cJSON_Parse(response.c_str());
+    if (json == nullptr) {
+        ESP_LOGE(TAG, "audiobook %s: JSON parse failed", action);
+        return;
+    }
+
+    auto album_title_item = cJSON_GetObjectItem(json, "album_title");
+    auto bvid_item = cJSON_GetObjectItem(json, "bvid");
+    auto total_item = cJSON_GetObjectItem(json, "total_episodes");
+    auto current_item = cJSON_GetObjectItem(json, "current_episode");
+    auto play_info = cJSON_GetObjectItem(json, "play_info");
+    auto play_url = cJSON_IsObject(play_info) ? cJSON_GetObjectItem(play_info, "play_url") : nullptr;
+    auto episode_title_item =
+        cJSON_IsObject(play_info) ? cJSON_GetObjectItem(play_info, "title") : nullptr;
+
+    if (!cJSON_IsString(album_title_item) || !cJSON_IsString(bvid_item) ||
+        !cJSON_IsNumber(total_item) || !cJSON_IsNumber(current_item) ||
+        !cJSON_IsString(play_url) || play_url->valuestring[0] == '\0') {
+        ESP_LOGE(TAG, "audiobook %s: unexpected response: %.200s", action, response.c_str());
+        cJSON_Delete(json);
+        return;
+    }
+
+    std::string album_title = album_title_item->valuestring;
+    std::string bvid = bvid_item->valuestring;
+    int total_episodes = total_item->valueint;
+    int current_episode = current_item->valueint;
+    std::string episode_title =
+        cJSON_IsString(episode_title_item) ? episode_title_item->valuestring : "";
+    std::string proxy_url = play_url->valuestring;
+    cJSON_Delete(json);
+
+    // The server returns /music/proxy; the device needs the Ogg/Opus stream.
+    const std::string from = "/music/proxy";
+    const std::string to = "/music/opus_stream";
+    auto pos = proxy_url.find(from);
+    std::string opus_url = (pos != std::string::npos)
+                               ? proxy_url.substr(0, pos) + to + proxy_url.substr(pos + from.size())
+                               : proxy_url;
+
+    // This device has no display, so playback feedback is log/status only.
+    ESP_LOGI(TAG, "audiobook %s: %s ep %d/%d '%s' (%s)", action, album_title.c_str(),
+             current_episode, total_episodes, episode_title.c_str(),
+             SanitizeUrlForLog(opus_url).c_str());
+
+    // Update album state and start playback on the main task. The generation
+    // check drops a result that a newer request or a stop superseded while the
+    // HTTP call was in flight.
+    Schedule([this, search_by_keyword, query = std::move(query), generation, album_title, bvid,
+              current_episode, total_episodes, opus_url]() {
+        {
+            std::lock_guard<std::mutex> lock(audiobook_mutex_);
+            if (generation != audiobook_generation_) {
+                ESP_LOGI(TAG, "audiobook: discarding stale %s result",
+                         search_by_keyword ? "search" : "resolve");
+                return;
+            }
+            audiobook_bvid_ = bvid;
+            audiobook_album_title_ = album_title;
+            audiobook_current_episode_ = current_episode;
+            audiobook_total_episodes_ = total_episodes;
+            if (search_by_keyword) {
+                audiobook_keyword_ = query;
+            }
+        }
+
+        // An audiobook replaces any radio station the user was listening to.
+        ClearRadioStatus();
+        CancelPendingMusicResume();
+        audio_service_.PlayMusicFromUrl(opus_url);
+        CloseMusicSessionSoon();
+    });
+}
+
+void Application::HandleRadioMessage(const cJSON* root) {
+    auto action = cJSON_GetObjectItem(root, "action");
+    if (!cJSON_IsString(action)) {
+        ESP_LOGW(TAG, "radio: missing action field");
+        return;
+    }
+
+    const char* action_str = action->valuestring;
+
+    if (strcmp(action_str, "stop") == 0) {
+        StopMusicPermanently();
+        ClearRadioStatus();
+        return;
+    }
+
+    if (strcmp(action_str, "next") == 0) {
+        if (!PlayNextRadioStation()) {
+            ESP_LOGW(TAG, "radio: no station list loaded");
+        }
+        return;
+    }
+
+    if (strcmp(action_str, "play") == 0 || strcmp(action_str, "search") == 0) {
+        auto query = cJSON_GetObjectItem(root, "q");
+        if (!cJSON_IsString(query)) {
+            query = cJSON_GetObjectItem(root, "query");
+        }
+        if (!cJSON_IsString(query)) {
+            query = cJSON_GetObjectItem(root, "keyword");
+        }
+        if (!cJSON_IsString(query) || query->valuestring[0] == '\0') {
+            ESP_LOGW(TAG, "radio: play requires a non-empty q field");
+            return;
+        }
+        SearchAndPlayRadio(query->valuestring);
+        return;
+    }
+
+    ESP_LOGW(TAG, "radio: unknown action: %s", action_str);
+}
+
+void Application::SearchAndPlayRadio(const std::string& query) {
+    if (query.empty()) {
+        ESP_LOGW(TAG, "radio: empty search query");
+        return;
+    }
+    StartRadioRequest(query);
+}
+
+bool Application::PlayNextRadioStation() {
+    RadioStation next;
+    {
+        std::lock_guard<std::mutex> lock(radio_mutex_);
+        if (radio_stations_.empty()) {
+            return false;
+        }
+        radio_station_index_ =
+            (radio_station_index_ + 1) % static_cast<int>(radio_stations_.size());
+        next = radio_stations_[radio_station_index_];
+    }
+
+    ESP_LOGI(TAG, "radio: switching to '%s'", next.name.c_str());
+    Schedule([this, url = std::move(next.play_url)]() {
+        // A live station replaces any audiobook album the user was in.
+        ClearAudiobookStatus();
+        CancelPendingMusicResume();
+        audio_service_.PlayMusicFromUrl(url);
+        CloseMusicSessionSoon();
+    });
+    return true;
+}
+
+bool Application::GetRadioStatus(RadioStatus* status) const {
+    if (status == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(radio_mutex_);
+    if (radio_stations_.empty()) {
+        return false;
+    }
+    status->query = radio_query_;
+    status->station_name = radio_stations_[radio_station_index_].name;
+    status->station_index = radio_station_index_ + 1;
+    status->total_stations = static_cast<int>(radio_stations_.size());
+    return true;
+}
+
+void Application::ClearRadioStatus() {
+    std::lock_guard<std::mutex> lock(radio_mutex_);
+    // Invalidate any in-flight /api/radio/play result.
+    ++radio_generation_;
+    radio_query_.clear();
+    radio_stations_.clear();
+    radio_station_index_ = 0;
+}
+
+void Application::StartRadioRequest(const std::string& query) {
+    uint32_t generation;
+    {
+        std::lock_guard<std::mutex> lock(radio_mutex_);
+        generation = ++radio_generation_;
+    }
+
+    auto* request = new RadioRequest{this, query, generation};
+    BaseType_t created = xTaskCreate(
+        [](void* arg) {
+            auto* request = static_cast<RadioRequest*>(arg);
+            auto* app = request->app;
+            std::string query = std::move(request->query);
+            uint32_t generation = request->generation;
+            delete request;
+            app->RadioRequestTask(std::move(query), generation);
+            vTaskDelete(nullptr);
+        },
+        "radio", 8192, request, 5, nullptr);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "radio: failed to create request task");
+        delete request;
+    }
+}
+
+void Application::RadioRequestTask(std::string query, uint32_t generation) {
+    std::string api_url =
+        std::string(kRadioApiBase) + "/api/radio/play?q=" + UrlEncode(query) + "&limit=5";
+    ESP_LOGI(TAG, "radio: GET %s", api_url.c_str());
+
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        ESP_LOGE(TAG, "radio: network unavailable");
+        return;
+    }
+
+    // The radio service checks that stations are alive before answering, so
+    // allow more time than a plain JSON request.
+    auto http = network->CreateHttp(10);
+    if (!http->Open("GET", api_url)) {
+        ESP_LOGE(TAG, "radio: HTTP open failed");
+        return;
+    }
+
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "radio: HTTP %d", status_code);
+        http->Close();
+        return;
+    }
+
+    std::string response = http->ReadAll();
+    http->Close();
+
+    cJSON* json = cJSON_Parse(response.c_str());
+    if (json == nullptr) {
+        ESP_LOGE(TAG, "radio: JSON parse failed");
+        return;
+    }
+
+    std::vector<RadioStation> stations;
+    auto data = cJSON_GetObjectItem(json, "data");
+    if (cJSON_IsArray(data)) {
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, data) {
+            auto name = cJSON_GetObjectItem(item, "name");
+            auto play_url = cJSON_GetObjectItem(item, "play_url");
+            if (cJSON_IsString(name) && cJSON_IsString(play_url) &&
+                play_url->valuestring[0] != '\0') {
+                stations.push_back({name->valuestring, play_url->valuestring});
+                if (stations.size() >= 10) {
+                    break;
+                }
+            }
+        }
+    }
+    cJSON_Delete(json);
+
+    if (stations.empty()) {
+        ESP_LOGW(TAG, "radio: no playable stations for '%s'", query.c_str());
+        return;
+    }
+
+    ESP_LOGI(TAG, "radio: %u stations for '%s', playing '%s'",
+             static_cast<unsigned>(stations.size()), query.c_str(), stations.front().name.c_str());
+
+    Schedule([this, query = std::move(query), generation, stations = std::move(stations)]() {
+        {
+            std::lock_guard<std::mutex> lock(radio_mutex_);
+            if (generation != radio_generation_) {
+                ESP_LOGI(TAG, "radio: discarding stale search result");
+                return;
+            }
+            radio_query_ = query;
+            radio_stations_ = stations;
+            radio_station_index_ = 0;
+        }
+
+        // Radio replaces any audiobook album or plain track state.
+        ClearAudiobookStatus();
+        CancelPendingMusicResume();
+        audio_service_.PlayMusicFromUrl(stations.front().play_url);
+        CloseMusicSessionSoon();
+    });
 }
 
 void Application::ResetProtocol() {

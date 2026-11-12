@@ -87,7 +87,7 @@ The release script changes local `sdkconfig` and build state. Do not assume the 
 - SDK compatibility: `docs/esp-idf-6-migration.md`
 - Board guide: `docs/custom-board.md`
 - Audio design: `main/audio/README.md`
-- Music playback (fork feature): `docs/music-playback.md`
+- Music, audiobook, and radio playback (fork feature): `docs/music-playback.md`
 - Code style: `docs/code_style.md`
 - Protocols: `docs/websocket.md`, `docs/mqtt-udp.md`, `docs/mcp-protocol.md`
 - CI matrix: `.github/workflows/build.yml`
