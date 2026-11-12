@@ -130,6 +130,8 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s",
                      cJSON_IsString(session_id) ? session_id->valuestring : "null");
             if (cJSON_IsString(session_id) && session_id_ == session_id->valuestring) {
+                // A server-initiated end must not auto-resume paused music.
+                Application::GetInstance().NotifyServerGoodbye();
                 auto alive = alive_;  // Capture alive flag
                 Application::GetInstance().Schedule([this, alive]() {
                     if (*alive) {

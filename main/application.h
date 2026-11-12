@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -33,6 +34,8 @@
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
 #define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
+#define MAIN_EVENT_MUSIC_RESUME_CHECK   (1 << 14)
+#define MAIN_EVENT_SERVER_GOODBYE_CHECK (1 << 15)
 
 
 enum AecMode {
@@ -129,12 +132,31 @@ public:
      */
     void HandleMusicMessage(const cJSON* root);
 
+    /**
+     * Permanently stop music and cancel any pending wake-word resume.
+     * Safe to call from any task.
+     */
+    void StopMusicPermanently();
+
+    /**
+     * Notify the application that the server ended the session (goodbye).
+     * A server-initiated session end must not auto-resume paused music.
+     * Safe to call from any task.
+     */
+    void NotifyServerGoodbye();
+
 private:
     Application();
     ~Application();
 
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
+    // Music resume is only allowed for a session the client closed on purpose
+    // (the 3-second silence path). Server-initiated ends do not resume music.
+    bool resume_music_after_session_ = false;
+    esp_timer_handle_t music_resume_timer_ = nullptr;
+    esp_timer_handle_t server_goodbye_timer_ = nullptr;
+    std::atomic<bool> server_goodbye_pending_{false};
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
@@ -166,6 +188,11 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    void HandleMusicResumeCheckEvent();
+    void HandleServerGoodbyeCheckEvent();
+    void CancelPendingMusicResume();
+    void CloseMusicSessionSoon();
+    void CloseMusicSession();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void BeginWakeWordInvoke(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);

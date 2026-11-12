@@ -19,8 +19,25 @@
 
 #define TAG "Application"
 
-// Bilibili Music API base URL (hardcoded; change here to point to a different instance)
-static constexpr char kBilibiliMusicApiBase[] = "http://8.153.171.156:18000";
+// Bilibili Music API base URL. Override with `config MUSIC_API_BASE_URL`.
+#ifndef CONFIG_MUSIC_API_BASE_URL
+#define CONFIG_MUSIC_API_BASE_URL "http://8.153.171.156:18000"
+#endif
+static constexpr char kBilibiliMusicApiBase[] = CONFIG_MUSIC_API_BASE_URL;
+
+namespace {
+
+// Music URLs carry signed, time-limited query parameters. Only log the
+// scheme/host/path so tokens never reach the serial console.
+std::string SanitizeUrlForLog(const std::string& url) {
+    auto query = url.find('?');
+    if (query == std::string::npos) {
+        return url;
+    }
+    return url.substr(0, query) + "?<redacted>";
+}
+
+}  // namespace
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -46,12 +63,42 @@ Application::Application() {
                                                 .name = "clock_timer",
                                                 .skip_unhandled_events = true};
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    esp_timer_create_args_t music_resume_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_MUSIC_RESUME_CHECK);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "music_resume",
+        .skip_unhandled_events = true};
+    esp_timer_create(&music_resume_args, &music_resume_timer_);
+
+    esp_timer_create_args_t server_goodbye_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_SERVER_GOODBYE_CHECK);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "server_goodbye",
+        .skip_unhandled_events = true};
+    esp_timer_create(&server_goodbye_args, &server_goodbye_timer_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (music_resume_timer_ != nullptr) {
+        esp_timer_stop(music_resume_timer_);
+        esp_timer_delete(music_resume_timer_);
+    }
+    if (server_goodbye_timer_ != nullptr) {
+        esp_timer_stop(server_goodbye_timer_);
+        esp_timer_delete(server_goodbye_timer_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -177,7 +224,8 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED |
+        MAIN_EVENT_MUSIC_RESUME_CHECK | MAIN_EVENT_SERVER_GOODBYE_CHECK;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -202,6 +250,14 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_STATE_CHANGED) {
             HandleStateChangedEvent();
+        }
+
+        if (bits & MAIN_EVENT_MUSIC_RESUME_CHECK) {
+            HandleMusicResumeCheckEvent();
+        }
+
+        if (bits & MAIN_EVENT_SERVER_GOODBYE_CHECK) {
+            HandleServerGoodbyeCheckEvent();
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
@@ -813,6 +869,87 @@ void Application::HandleStopListeningEvent() {
     }
 }
 
+void Application::CancelPendingMusicResume() {
+    esp_timer_stop(music_resume_timer_);
+    resume_music_after_session_ = false;
+}
+
+void Application::HandleMusicResumeCheckEvent() {
+    if (GetDeviceState() != kDeviceStateListening) {
+        return;
+    }
+    if (audio_service_.IsVoiceDetected()) {
+        return;
+    }
+    if (!audio_service_.HasMusicToResume()) {
+        return;
+    }
+    if (!protocol_ || !protocol_->IsAudioChannelOpened()) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Closing conversation to resume music");
+    // Mark the close as intentional so the idle handler resumes the track.
+    resume_music_after_session_ = true;
+    protocol_->CloseAudioChannel(false);
+    SetDeviceState(kDeviceStateIdle);
+}
+
+void Application::HandleServerGoodbyeCheckEvent() {
+    if (!server_goodbye_pending_.exchange(false)) {
+        return;
+    }
+    // A new interaction may have started in the meantime; never discard a
+    // track that is still owned by the current pause/resume flow.
+    if (GetDeviceState() != kDeviceStateIdle || resume_music_after_session_) {
+        return;
+    }
+    if (audio_service_.HasMusicToResume()) {
+        ESP_LOGI(TAG, "Server ended the session; discarding paused music");
+        audio_service_.ClearMusicResume();
+    }
+}
+
+void Application::CloseMusicSessionSoon() {
+    // Give the stream a moment to reach the speaker before closing the audio
+    // channel. The delay runs in a background task, never on the main loop.
+    xTaskCreate([](void* arg) {
+        auto* app = static_cast<Application*>(arg);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        app->Schedule([app]() { app->CloseMusicSession(); });
+        vTaskDelete(nullptr);
+    }, "music_close", 3072, this, 5, nullptr);
+}
+
+void Application::CloseMusicSession() {
+    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+        ESP_LOGI(TAG, "Closing audio channel to prevent TTS during music playback");
+        protocol_->CloseAudioChannel(false);
+    }
+    DeviceState state = GetDeviceState();
+    if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+}
+
+void Application::StopMusicPermanently() {
+    Schedule([this]() {
+        CancelPendingMusicResume();
+        audio_service_.StopMusic();
+        audio_service_.ClearMusicResume();
+    });
+}
+
+void Application::NotifyServerGoodbye() {
+    // The server ended the session (timeout, farewell, or shutdown). Remember
+    // it, then decide shortly afterwards whether the device stayed idle. A new
+    // wake-word session starts within this window and must not be mistaken for
+    // a shutdown.
+    server_goodbye_pending_.store(true);
+    esp_timer_stop(server_goodbye_timer_);
+    esp_timer_start_once(server_goodbye_timer_, 2 * 1000 * 1000);
+}
+
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
@@ -821,6 +958,10 @@ void Application::HandleWakeWordDetectedEvent() {
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+
+    // A new wake word starts a new interaction; do not let a pending
+    // "close the session to resume music" timer fire during it.
+    CancelPendingMusicResume();
 
     // Pause music when wake word is detected (user wants to talk)
     // Music position is saved so it can be resumed after the conversation
@@ -923,6 +1064,13 @@ void Application::HandleStateChangedEvent() {
     // Music stopping is now handled in HandleWakeWordDetectedEvent
     // Don't stop music when transitioning between states
     clock_ticks_ = 0;
+
+    // A pending music-resume close only makes sense while the device is still
+    // listening. Any state transition cancels the old check; entering
+    // listening below arms a fresh one when appropriate.
+    bool resume_music_on_idle = (new_state == kDeviceStateIdle) && resume_music_after_session_;
+    esp_timer_stop(music_resume_timer_);
+    resume_music_after_session_ = false;
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
@@ -940,10 +1088,12 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
-            // Auto-resume music if it was paused by a wake word interruption
-            if (audio_service_.HasMusicToResume()) {
+            // Only resume music when this idle transition came from our own
+            // 3-second silence path. A server-initiated goodbye (shutdown,
+            // timeout, farewell) must not restart music.
+            if (resume_music_on_idle && audio_service_.HasMusicToResume()) {
                 ESP_LOGI(TAG, "Auto-resuming music after conversation");
-                Schedule([this]() { audio_service_.ResumeMusic(); });
+                audio_service_.ResumeMusic();
             }
             break;
         case kDeviceStateConnecting:
@@ -972,24 +1122,12 @@ void Application::HandleStateChangedEvent() {
 
             // If AI just finished speaking (Speaking->Listening) and music was paused,
             // close the session after 3 seconds of silence so music can resume immediately
-            // instead of waiting for Dify's 60-90s timeout.
+            // instead of waiting for Dify's 60-90s timeout. A one-shot timer replaces the
+            // per-transition task, so repeated transitions cannot stack checks.
             if (old_state == kDeviceStateSpeaking && audio_service_.HasMusicToResume()) {
                 ESP_LOGI(TAG, "Music paused: will resume in 3s if user stays silent");
-                xTaskCreate([](void* arg) {
-                    auto* app = static_cast<Application*>(arg);
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                    app->Schedule([app]() {
-                        if (app->GetDeviceState() == kDeviceStateListening &&
-                            !app->audio_service_.IsVoiceDetected() &&
-                            app->audio_service_.HasMusicToResume() &&
-                            app->protocol_ && app->protocol_->IsAudioChannelOpened()) {
-                            ESP_LOGI("Application", "Closing conversation to resume music");
-                            app->protocol_->CloseAudioChannel(false);
-                            app->SetDeviceState(kDeviceStateIdle);
-                        }
-                    });
-                    vTaskDelete(nullptr);
-                }, "music_resume", 2048, this, 1, nullptr);
+                esp_timer_stop(music_resume_timer_);
+                esp_timer_start_once(music_resume_timer_, 3 * 1000 * 1000);
             }
             break;
         case kDeviceStateSpeaking:
@@ -1234,10 +1372,7 @@ void Application::HandleMusicMessage(const cJSON* root) {
 
     // Handle stop action — permanently stop, clear any saved resume state
     if (strcmp(action_str, "stop") == 0) {
-        Schedule([this]() {
-            audio_service_.StopMusic();
-            audio_service_.ClearMusicResume();
-        });
+        StopMusicPermanently();
         return;
     }
 
@@ -1249,20 +1384,10 @@ void Application::HandleMusicMessage(const cJSON* root) {
             return;
         }
         Schedule([this, url_str = std::string(url->valuestring)]() {
+            CancelPendingMusicResume();
             audio_service_.PlayMusicFromUrl(url_str);
-
-            // Close the audio channel after a short delay to prevent AI from continuing to talk
-            Schedule([this]() {
-                vTaskDelay(pdMS_TO_TICKS(1000));  // Wait 1 second for music to start
-                if (protocol_ && protocol_->IsAudioChannelOpened()) {
-                    ESP_LOGI(TAG, "Closing audio channel to prevent TTS during music playback");
-                    protocol_->CloseAudioChannel(false);  // Don't send goodbye
-                }
-                DeviceState state = GetDeviceState();
-                if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
-                    SetDeviceState(kDeviceStateIdle);
-                }
-            });
+            // The delay runs in a background task, not on the main event loop.
+            CloseMusicSessionSoon();
         });
         return;
     }
@@ -1378,26 +1503,18 @@ void Application::HandleMusicMessage(const cJSON* root) {
             ? proxy_url.substr(0, pos) + to + proxy_url.substr(pos + from.size())
             : proxy_url;
 
-        ESP_LOGI(TAG, "music %s: playing %s", action_copy.c_str(), opus_url.c_str());
+        ESP_LOGI(TAG, "music %s: playing %s", action_copy.c_str(),
+                 SanitizeUrlForLog(opus_url).c_str());
 
-        // Play via AudioService (thread-safe via AudioService's internal queue)
-        auto& app = Application::GetInstance();
-        app.GetAudioService().PlayMusicFromUrl(opus_url);
-
-        // Wait 1 second in the background task (NOT in the main task via Schedule)
-        // to avoid blocking the main loop and triggering the task watchdog.
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        // Close the audio channel to prevent AI from continuing to talk over the music
-        app.Schedule([&app]() {
-            if (app.protocol_ && app.protocol_->IsAudioChannelOpened()) {
-                ESP_LOGI(TAG, "Closing audio channel to prevent TTS during music playback");
-                app.protocol_->CloseAudioChannel(false);  // Don't send goodbye
-            }
-            DeviceState state = app.GetDeviceState();
-            if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
-                app.SetDeviceState(kDeviceStateIdle);
-            }
+        // All AudioService/codec state is mutated on the main task. Capture the
+        // URL by value; the singleton is fetched inside the lambda so no
+        // transient stack reference is captured.
+        Application::GetInstance().Schedule([opus_url]() {
+            auto& app = Application::GetInstance();
+            app.CancelPendingMusicResume();
+            app.GetAudioService().PlayMusicFromUrl(opus_url);
+            // The delay runs in a background task, not on the main loop.
+            app.CloseMusicSessionSoon();
         });
 
         vTaskDelete(nullptr);

@@ -95,6 +95,10 @@ struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
+    // Music frames must be preserved across ResetDecoder() calls while TTS is
+    // reset. Use an explicit flag instead of relying on timestamp == 0, which
+    // can also occur for the first TTS/notification frame of a session.
+    bool is_music = false;
 };
 
 struct DebugStatistics {
@@ -142,7 +146,7 @@ public:
     void StopMusic();
     void PauseMusic();                             // Save position and stop (wake word interrupt)
     bool ResumeMusic();                            // Resume from saved position
-    bool HasMusicToResume() const { return !music_resume_url_.empty(); }
+    bool HasMusicToResume() const;
     void ClearMusicResume();                       // Clear saved state (explicit user stop)
     bool IsMusicPlaying() const { return music_playing_.load(); }
 
@@ -177,15 +181,22 @@ private:
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
     // Music streaming
-    TaskHandle_t music_task_handle_ = nullptr;
+    std::atomic<TaskHandle_t> music_task_handle_{nullptr};
     std::atomic<bool> music_playing_{false};
     std::atomic<bool> music_abort_{false};
+    // Incremented whenever playback is (re)started or stopped. A MusicTask only
+    // touches shared audio state while its generation is still current, which
+    // prevents an exiting task from clobbering a newly started one.
+    std::atomic<uint32_t> music_generation_{0};
     std::string music_url_;
-    std::atomic<uint32_t> music_frames_decoded_{0}; // Opus frames decoded (for time tracking)
+    std::atomic<uint32_t> music_played_ms_{0};      // Audio played since stream start
+    std::atomic<uint32_t> music_start_offset_secs_{0};
     std::mutex music_url_mutex_;
-    void* music_opus_decoder_ = nullptr;
-    esp_ae_rate_cvt_handle_t music_resampler_ = nullptr;
+    // Serializes MusicTask instances so a new stream cannot start until the
+    // previous one has fully released the codec and HTTP connection.
+    std::mutex music_control_mutex_;
     // Music pause/resume state (set by PauseMusic, cleared by ResumeMusic/ClearMusicResume)
+    mutable std::mutex music_state_mutex_;
     std::string music_resume_url_;
     uint32_t music_resume_time_secs_{0};            // Playback time saved on pause (seconds)
     std::mutex audio_queue_mutex_;
@@ -195,6 +206,10 @@ private:
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+    // Recycled PCM buffers for music playback. AudioOutputTask returns a
+    // music buffer here after playing it, so MusicTask usually does not need
+    // to allocate a fresh vector for every Opus packet.
+    std::vector<std::vector<int16_t>> music_pcm_pool_;
     bool decode_in_flight_ = false;
     bool output_in_flight_ = false;
     bool playback_drained_notified_ = true;
@@ -219,7 +234,7 @@ private:
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
-    void MusicTask();
+    void MusicTask(uint32_t generation);
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool InitializeAudioEngine();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);

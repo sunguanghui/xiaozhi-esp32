@@ -128,7 +128,7 @@ void McpServer::AddCommonTools() {
         "  `keyword`: The search keyword (song name, artist name, or both).\n"
         "  `time_range`: Optional time range filter. Can be 'day', 'week', 'month', or 'all'. Default is 'week'.\n"
         "Return:\n"
-        "  A boolean indicating success or failure.",
+        "  true if the playback request was accepted. Search and playback run asynchronously.",
         PropertyList({
             Property("keyword", kPropertyTypeString),
             Property("time_range", kPropertyTypeString, std::string("week"))
@@ -144,12 +144,12 @@ void McpServer::AddCommonTools() {
             cJSON_AddStringToObject(message, "keyword", keyword.c_str());
             cJSON_AddStringToObject(message, "time_range", time_range.c_str());
 
-            // Convert to string and send via protocol
-            char* json_str = cJSON_PrintUnformatted(message);
+            // Hand the request to the application. Playback starts
+            // asynchronously, so this return value only means the request was
+            // accepted, not that audio is already playing.
             auto& app = Application::GetInstance();
             app.HandleMusicMessage(message);
 
-            cJSON_free(json_str);
             cJSON_Delete(message);
 
             return true;
@@ -160,7 +160,7 @@ void McpServer::AddCommonTools() {
         "Args:\n"
         "  `url`: The direct URL of the audio file or stream.\n"
         "Return:\n"
-        "  A boolean indicating success or failure.",
+        "  true if the playback request was accepted. Playback starts asynchronously.",
         PropertyList({
             Property("url", kPropertyTypeString)
         }),
@@ -190,9 +190,9 @@ void McpServer::AddCommonTools() {
         "  A boolean indicating success or failure.",
         PropertyList(),
         [](const PropertyList& properties) -> ReturnValue {
-            auto& app = Application::GetInstance();
-            app.GetAudioService().StopMusic();
-            app.GetAudioService().ClearMusicResume();  // Permanent stop, don't auto-resume
+            // Schedule the mutation on the main task; MCP callbacks run on the
+            // network thread and must not touch AudioService state directly.
+            Application::GetInstance().StopMusicPermanently();
             return true;
         });
 
@@ -201,7 +201,8 @@ void McpServer::AddCommonTools() {
         "Return:\n"
         "  A JSON object: {playing: bool, paused: bool}\n"
         "  playing=true means music is actively playing.\n"
-        "  paused=true means music was interrupted and will auto-resume after conversation.",
+        "  paused=true means music was interrupted and may resume after the conversation;\n"
+        "  a server-initiated session end clears the saved position.",
         PropertyList(),
         [](const PropertyList& properties) -> ReturnValue {
             auto& app = Application::GetInstance();

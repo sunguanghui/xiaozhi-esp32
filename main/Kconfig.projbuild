@@ -6,6 +6,15 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config MUSIC_API_BASE_URL
+    string "Music API base URL"
+    default "http://8.153.171.156:18000"
+    help
+        Base URL of the Bilibili music proxy used by the built-in music MCP tools.
+        Leave empty to keep the tools registered but make music search fail; the
+        firmware does not validate this value at build time.
+        Prefer an HTTPS endpoint when possible.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

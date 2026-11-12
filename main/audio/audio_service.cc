@@ -1,5 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
@@ -29,6 +31,70 @@
 #endif
 
 #define TAG "AudioService"
+
+namespace {
+
+constexpr char kStartTimeParam[] = "start_time=";
+
+// Remove all start_time query parameters so a resumed URL does not accumulate
+// stale offsets. Handles both "?start_time=" and "&start_time=".
+std::string StripStartTimeParam(const std::string& url) {
+    std::string result = url;
+    size_t search_from = 0;
+    while (true) {
+        auto pos = result.find(kStartTimeParam, search_from);
+        if (pos == std::string::npos) {
+            break;
+        }
+        size_t begin = pos;
+        size_t end = pos + sizeof(kStartTimeParam) - 1;
+        while (end < result.size() && result[end] != '&' && result[end] != '#') {
+            ++end;
+        }
+        if (begin > 0 && result[begin - 1] == '&') {
+            --begin;  // Remove the separating '&' as well.
+        } else if (begin > 0 && result[begin - 1] == '?') {
+            // Keep '?' but drop the trailing '&' so the remaining query is valid.
+            if (end < result.size() && result[end] == '&') {
+                ++end;
+            }
+        }
+        result.erase(begin, end - begin);
+        search_from = begin;
+    }
+    // If start_time was the only query parameter, do not leave a dangling
+    // separator behind (a later "?start_time=N" would otherwise become "?&...").
+    while (!result.empty() && (result.back() == '&' || result.back() == '?')) {
+        result.pop_back();
+    }
+    return result;
+}
+
+uint32_t ExtractStartTimeSecs(const std::string& url) {
+    auto pos = url.rfind(kStartTimeParam);
+    if (pos == std::string::npos) {
+        return 0;
+    }
+    pos += sizeof(kStartTimeParam) - 1;
+    char* end = nullptr;
+    unsigned long value = std::strtoul(url.c_str() + pos, &end, 10);
+    if (end == url.c_str() + pos) {
+        return 0;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+// Music URLs contain signed, time-limited query parameters. Only log the
+// scheme/host/path so tokens do not end up in serial logs.
+std::string SanitizeUrlForLog(const std::string& url) {
+    auto query = url.find('?');
+    if (query == std::string::npos) {
+        return url;
+    }
+    return url.substr(0, query) + "?<redacted>";
+}
+
+}  // namespace
 
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
@@ -165,6 +231,9 @@ void AudioService::Start() {
 }
 
 void AudioService::Stop() {
+    // Abort an in-flight music stream: the output task is about to stop
+    // consuming frames, so MusicTask must not keep pushing into the queue.
+    StopMusic();
     esp_timer_stop(audio_power_timer_);
     service_stopped_.store(true);
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
@@ -339,8 +408,24 @@ void AudioService::AudioOutputTask() {
         last_output_time_ = std::chrono::steady_clock::now();
         debug_statistics_.playback_count++;
 
+        // Track music position from audio that actually reached the speaker.
+        // Frames still queued when playback is paused are dropped by
+        // StopMusic(), so they must not advance the resume position.
+        if (task->is_music) {
+            int output_rate = codec_->output_sample_rate();
+            if (output_rate > 0) {
+                music_played_ms_.fetch_add(static_cast<uint32_t>(
+                    static_cast<uint64_t>(task->pcm.size()) * 1000 / output_rate));
+            }
+        }
+
         bool notify_drained = false;
         lock.lock();
+        // Recycle the PCM buffer of a music frame so the streaming task can
+        // reuse its capacity instead of allocating on every packet.
+        if (task->is_music && music_pcm_pool_.size() < 2) {
+            music_pcm_pool_.push_back(std::move(task->pcm));
+        }
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
         if (task->timestamp > 0) {
@@ -753,14 +838,14 @@ void AudioService::ResetDecoder() {
         timestamp_queue_.clear();
         audio_decode_queue_.clear();
 
-        // Clear playback queue but preserve music tasks (timestamp == 0)
+        // Clear playback queue but preserve music tasks
         size_t before_size = audio_playback_queue_.size();
         if (music_playing_.load()) {
             // Keep music tasks in playback queue, remove only TTS tasks
             audio_playback_queue_.erase(
                 std::remove_if(audio_playback_queue_.begin(), audio_playback_queue_.end(),
                     [](const std::unique_ptr<AudioTask>& task) {
-                        return task->timestamp != 0;  // Remove TTS tasks (timestamp != 0)
+                        return !task->is_music;
                     }),
                 audio_playback_queue_.end()
             );
@@ -855,106 +940,180 @@ void AudioService::EnableOutputForMusic() {
     }
 }
 
+namespace {
+struct MusicTaskArgs {
+    AudioService* service;
+    uint32_t generation;
+};
+}  // namespace
+
 void AudioService::PlayMusicFromUrl(const std::string& url) {
-    // Stop any existing music and wait briefly for the task to exit
-    if (music_playing_.load() || music_task_handle_ != nullptr) {
-        music_abort_.store(true);
-        music_playing_.store(false);
-        for (int i = 0; i < 25 && music_task_handle_ != nullptr; i++) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
+    // A new track supersedes any paused/resumable one. Without this, starting
+    // a new song while an old one is paused would let the old track resume
+    // when the audio channel closes.
+    {
+        std::lock_guard<std::mutex> lock(music_state_mutex_);
+        music_resume_url_.clear();
+        music_resume_time_secs_ = 0;
     }
+
+    // Invalidate any running MusicTask. The task checks this generation on
+    // every read/decode and exits without touching the new stream's state.
+    uint32_t generation = music_generation_.fetch_add(1) + 1;
+    music_abort_.store(false);
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         music_url_ = url;
     }
-    music_frames_decoded_.store(0);
-    music_abort_.store(false);
+    music_played_ms_.store(0);
+    music_start_offset_secs_.store(ExtractStartTimeSecs(url));
     music_playing_.store(true);
     EnableOutputForMusic();
-    xTaskCreate([](void* arg) {
-        static_cast<AudioService*>(arg)->MusicTask();
-    }, "music", 16384, this, 5, &music_task_handle_);
+
+    auto* args = new MusicTaskArgs{this, generation};
+    TaskHandle_t handle = nullptr;
+    BaseType_t created = xTaskCreate([](void* arg) {
+        auto* args = static_cast<MusicTaskArgs*>(arg);
+        {
+            // MusicTask instances are serialized: the previous stream must
+            // finish before the new one can use the codec/HTTP client.
+            std::unique_lock<std::mutex> control(args->service->music_control_mutex_);
+            args->service->MusicTask(args->generation);
+        }
+        // Always release the handle, including early aborts. The CAS keeps a
+        // stale task from clearing a newer stream's handle.
+        TaskHandle_t self = xTaskGetCurrentTaskHandle();
+        TaskHandle_t expected = self;
+        args->service->music_task_handle_.compare_exchange_strong(expected, nullptr);
+        delete args;
+        vTaskDelete(nullptr);
+    }, "music", 16384, args, 5, &handle);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "PlayMusicFromUrl: failed to create music task");
+        delete args;
+        music_playing_.store(false);
+        return;
+    }
+    music_task_handle_.store(handle);
 }
 
 void AudioService::PauseMusic() {
-    if (!music_playing_.load()) return;
-    uint32_t time_secs = music_frames_decoded_.load() * OPUS_FRAME_DURATION_MS / 1000;
+    if (!music_playing_.load()) {
+        return;
+    }
+
+    uint32_t time_secs = music_start_offset_secs_.load() + music_played_ms_.load() / 1000;
+    std::string url;
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
-        music_resume_url_ = music_url_;
+        url = StripStartTimeParam(music_url_);
     }
-    music_resume_time_secs_ = time_secs;
+    {
+        std::lock_guard<std::mutex> lock(music_state_mutex_);
+        music_resume_url_ = std::move(url);
+        music_resume_time_secs_ = time_secs;
+    }
     ESP_LOGI(TAG, "PauseMusic: saving resume position at %u seconds", time_secs);
     StopMusic();
 }
 
 bool AudioService::ResumeMusic() {
-    if (music_resume_url_.empty()) return false;
-    std::string url = music_resume_url_;
-    uint32_t time_secs = music_resume_time_secs_;
-    music_resume_url_.clear();
-    music_resume_time_secs_ = 0;
-    // Remove any existing start_time parameter to avoid accumulation
-    auto st_pos = url.find("&start_time=");
-    if (st_pos != std::string::npos) {
-        url = url.substr(0, st_pos);
+    std::string url;
+    uint32_t time_secs = 0;
+    {
+        std::lock_guard<std::mutex> lock(music_state_mutex_);
+        if (music_resume_url_.empty()) {
+            return false;
+        }
+        url = music_resume_url_;
+        time_secs = music_resume_time_secs_;
+        music_resume_url_.clear();
+        music_resume_time_secs_ = 0;
     }
+
+    url = StripStartTimeParam(url);
     if (time_secs > 0) {
-        url += "&start_time=" + std::to_string(time_secs);
+        url += (url.find('?') == std::string::npos) ? "?" : "&";
+        url += kStartTimeParam;
+        url += std::to_string(time_secs);
     }
     ESP_LOGI(TAG, "ResumeMusic: resuming from %u seconds", time_secs);
     PlayMusicFromUrl(url);
     return true;
 }
 
+bool AudioService::HasMusicToResume() const {
+    std::lock_guard<std::mutex> lock(music_state_mutex_);
+    return !music_resume_url_.empty();
+}
+
 void AudioService::ClearMusicResume() {
+    std::lock_guard<std::mutex> lock(music_state_mutex_);
     music_resume_url_.clear();
     music_resume_time_secs_ = 0;
 }
 
 void AudioService::StopMusic() {
-    if (!music_playing_.load() && music_task_handle_ == nullptr) return;
+    if (!music_playing_.load() && music_task_handle_.load() == nullptr) {
+        return;
+    }
     ESP_LOGI(TAG, "StopMusic called");
     music_abort_.store(true);
+    // Invalidate the running task so it cannot publish progress or clear the
+    // playing flag after a new stream has started.
+    music_generation_.fetch_add(1);
     music_playing_.store(false);
-    // Drain any buffered music frames from the playback queue so the codec
-    // goes quiet immediately (best-effort; AudioOutputTask may have one
-    // in-flight frame that finishes naturally).
-    {
-        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-        // Only remove AudioTask entries that were pushed by MusicTask
-        // (timestamp == 0 and type == kAudioTaskTypeDecodeToPlaybackQueue).
-        // In practice it's safest to leave the queue alone here and let
-        // ResetDecoder() handle it if the caller needs a hard flush.
-    }
+
+    // Drop buffered music frames so the speaker goes quiet immediately. A
+    // frame already owned by AudioOutputTask finishes naturally.
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    audio_playback_queue_.erase(
+        std::remove_if(audio_playback_queue_.begin(), audio_playback_queue_.end(),
+            [](const std::unique_ptr<AudioTask>& task) { return task->is_music; }),
+        audio_playback_queue_.end());
+    audio_queue_cv_.notify_all();
 }
 
-void AudioService::MusicTask() {
+void AudioService::MusicTask(uint32_t generation) {
+    auto is_aborted = [this, generation]() {
+        return music_abort_.load() || music_generation_.load() != generation;
+    };
+
+    if (is_aborted()) {
+        return;
+    }
+
     std::string url;
     {
         std::lock_guard<std::mutex> lock(music_url_mutex_);
         url = music_url_;
     }
-    ESP_LOGI(TAG, "MusicTask: start streaming '%s'", url.c_str());
+    ESP_LOGI(TAG, "MusicTask: start streaming '%s'", SanitizeUrlForLog(url).c_str());
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
 
+    // The decoder and resampler are owned by this task instance. Keeping them
+    // local means a task that is being replaced can never close the new
+    // stream's decoder.
+    void* opus_decoder = nullptr;
+    esp_ae_rate_cvt_handle_t resampler = nullptr;
+    int current_sample_rate = 48000;
+
     auto cleanup = [&]() {
         http->Close();
-        if (music_opus_decoder_) {
-            esp_opus_dec_close(music_opus_decoder_);
-            music_opus_decoder_ = nullptr;
+        if (opus_decoder != nullptr) {
+            esp_opus_dec_close(opus_decoder);
+            opus_decoder = nullptr;
         }
-        if (music_resampler_) {
-            esp_ae_rate_cvt_close(music_resampler_);
-            music_resampler_ = nullptr;
+        if (resampler != nullptr) {
+            esp_ae_rate_cvt_close(resampler);
+            resampler = nullptr;
         }
-        music_playing_.store(false);
-        music_task_handle_ = nullptr;
+        if (music_generation_.load() == generation) {
+            music_playing_.store(false);
+        }
         ESP_LOGI(TAG, "MusicTask: done");
-        vTaskDelete(nullptr);
     };
 
     if (!http->Open("GET", url)) {
@@ -969,13 +1128,18 @@ void AudioService::MusicTask() {
         return;
     }
 
+    auto open_decoder = [&](int sample_rate) {
+        if (opus_decoder != nullptr) {
+            esp_opus_dec_close(opus_decoder);
+            opus_decoder = nullptr;
+        }
+        esp_opus_dec_cfg_t dec_cfg = OPUS_DEC_CFG(sample_rate, OPUS_FRAME_DURATION_MS);
+        esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &opus_decoder);
+        return opus_decoder != nullptr;
+    };
+
     // Create a dedicated Opus decoder for music (keeps TTS decoder untouched)
-    int current_sample_rate = 48000;
-    {
-        esp_opus_dec_cfg_t dec_cfg = OPUS_DEC_CFG(current_sample_rate, OPUS_FRAME_DURATION_MS);
-        esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &music_opus_decoder_);
-    }
-    if (!music_opus_decoder_) {
+    if (!open_decoder(current_sample_rate)) {
         ESP_LOGE(TAG, "MusicTask: failed to open opus decoder");
         cleanup();
         return;
@@ -983,39 +1147,53 @@ void AudioService::MusicTask() {
 
     // Resampler if codec output rate differs from stream rate
     auto maybe_open_resampler = [&](int src_rate) {
-        if (music_resampler_) {
-            esp_ae_rate_cvt_close(music_resampler_);
-            music_resampler_ = nullptr;
+        if (resampler != nullptr) {
+            esp_ae_rate_cvt_close(resampler);
+            resampler = nullptr;
         }
         if (src_rate != codec_->output_sample_rate()) {
             esp_ae_rate_cvt_cfg_t rcvt = RATE_CVT_CFG(src_rate, codec_->output_sample_rate(), 1);
-            esp_ae_rate_cvt_open(&rcvt, &music_resampler_);
+            esp_ae_rate_cvt_open(&rcvt, &resampler);
         }
     };
     maybe_open_resampler(current_sample_rate);
 
+    // Scratch buffer reused by every packet. AudioTask still owns the PCM
+    // vector that is handed to the playback queue, but the resample stage no
+    // longer allocates on every frame.
+    std::vector<int16_t> resample_buffer;
+
     // OggDemuxer: synchronous callbacks fired from Process()
     auto demuxer = std::make_unique<OggDemuxer>();
     demuxer->OnDemuxerFinished([&](const uint8_t* data, int sample_rate, size_t len) {
-        if (music_abort_.load()) return;
+        if (is_aborted()) return;
 
         // Reconfigure decoder and resampler when the stream's sample rate is known
         if (sample_rate != current_sample_rate) {
             current_sample_rate = sample_rate;
-            esp_opus_dec_close(music_opus_decoder_);
-            music_opus_decoder_ = nullptr;
-            esp_opus_dec_cfg_t new_cfg = OPUS_DEC_CFG(sample_rate, OPUS_FRAME_DURATION_MS);
-            esp_opus_dec_open(&new_cfg, sizeof(new_cfg), &music_opus_decoder_);
-            if (!music_opus_decoder_) { music_abort_.store(true); return; }
+            if (!open_decoder(sample_rate)) {
+                music_abort_.store(true);
+                return;
+            }
             maybe_open_resampler(sample_rate);
         }
 
-        // Count decoded frames for time tracking (used by PauseMusic)
-        ++music_frames_decoded_;
+        // Decode directly into the AudioTask's buffer. Buffers normally come
+        // from the recycle pool, so steady-state playback does not allocate.
+        constexpr size_t kMaxPcmSamples = 48000 / 1000 * 120;
+        auto task = std::make_unique<AudioTask>();
+        task->type      = kAudioTaskTypeDecodeToPlaybackQueue;
+        task->is_music  = true;
+        task->timestamp = 0;
+        {
+            std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+            if (!music_pcm_pool_.empty()) {
+                task->pcm = std::move(music_pcm_pool_.back());
+                music_pcm_pool_.pop_back();
+            }
+        }
+        task->pcm.resize(kMaxPcmSamples);
 
-        // Decode Opus packet → PCM
-        constexpr size_t kMaxPcmSamples = 48000 / 1000 * OPUS_FRAME_DURATION_MS;
-        std::vector<int16_t> pcm(kMaxPcmSamples);
         esp_audio_dec_in_raw_t raw = {
             .buffer        = const_cast<uint8_t*>(data),
             .len           = (uint32_t)len,
@@ -1023,41 +1201,40 @@ void AudioService::MusicTask() {
             .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
         };
         esp_audio_dec_out_frame_t out_frame = {
-            .buffer = (uint8_t*)pcm.data(),
-            .len    = (uint32_t)(pcm.size() * sizeof(int16_t)),
+            .buffer = (uint8_t*)task->pcm.data(),
+            .len    = (uint32_t)(task->pcm.size() * sizeof(int16_t)),
             .decoded_size = 0,
         };
         esp_audio_dec_info_t dec_info = {};
-        auto ret = esp_opus_dec_decode(music_opus_decoder_, &raw, &out_frame, &dec_info);
+        auto ret = esp_opus_dec_decode(opus_decoder, &raw, &out_frame, &dec_info);
         if (ret != ESP_AUDIO_ERR_OK) {
             ESP_LOGW(TAG, "MusicTask: opus decode err %d", ret);
             return;
         }
-        pcm.resize(out_frame.decoded_size / sizeof(int16_t));
-
-        // Resample to codec output rate if needed
-        if (music_resampler_ != nullptr) {
-            uint32_t max_out = 0;
-            esp_ae_rate_cvt_get_max_out_sample_num(music_resampler_, pcm.size(), &max_out);
-            std::vector<int16_t> resampled(max_out);
-            uint32_t actual_out = max_out;
-            esp_ae_rate_cvt_process(music_resampler_,
-                                    (esp_ae_sample_t)pcm.data(), pcm.size(),
-                                    (esp_ae_sample_t)resampled.data(), &actual_out);
-            resampled.resize(actual_out);
-            pcm = std::move(resampled);
+        task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
+        if (task->pcm.empty()) {
+            return;
         }
 
-        // Push decoded PCM into the shared playback queue.
-        // Block until there is space or until we are aborted.
-        auto task = std::make_unique<AudioTask>();
-        task->type      = kAudioTaskTypeDecodeToPlaybackQueue;
-        task->timestamp = 0;
-        task->pcm       = std::move(pcm);
+        // Resample to codec output rate if needed
+        if (resampler != nullptr) {
+            uint32_t max_out = 0;
+            esp_ae_rate_cvt_get_max_out_sample_num(resampler, task->pcm.size(), &max_out);
+            if (resample_buffer.size() < max_out) {
+                resample_buffer.resize(max_out);
+            }
+            uint32_t actual_out = max_out;
+            esp_ae_rate_cvt_process(resampler,
+                                    (esp_ae_sample_t)task->pcm.data(), task->pcm.size(),
+                                    (esp_ae_sample_t)resample_buffer.data(), &actual_out);
+            task->pcm.assign(resample_buffer.begin(), resample_buffer.begin() + actual_out);
+        }
 
         ESP_LOGD(TAG, "MusicTask: decoded %u PCM samples, pushing to queue", task->pcm.size());
 
-        while (!music_abort_.load()) {
+        // Push decoded PCM into the shared playback queue.
+        // Block until there is space or until we are aborted.
+        while (!is_aborted()) {
             std::unique_lock<std::mutex> lock(audio_queue_mutex_);
             if (audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
                 audio_playback_queue_.push_back(std::move(task));
@@ -1077,7 +1254,7 @@ void AudioService::MusicTask() {
     constexpr size_t kBufSize = 4096;
     std::vector<uint8_t> buf(kBufSize);
     size_t total_bytes = 0;
-    while (!music_abort_.load()) {
+    while (!is_aborted()) {
         int n = http->Read(reinterpret_cast<char*>(buf.data()), kBufSize);
         if (n <= 0) {
             ESP_LOGI(TAG, "MusicTask: HTTP read ended, n=%d, total_bytes=%u", n, total_bytes);
@@ -1091,6 +1268,6 @@ void AudioService::MusicTask() {
     }
 
     ESP_LOGI(TAG, "MusicTask: streaming finished, total=%u KB, aborted=%d",
-             total_bytes / 1024, music_abort_.load());
+             total_bytes / 1024, is_aborted());
     cleanup();
 }
